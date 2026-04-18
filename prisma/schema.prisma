@@ -1,0 +1,262 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-1.1.x"]
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model user {
+  id    Int                      @id @default(autoincrement()) // Removed the map directive
+  name              String       @db.VarChar(200)
+  location          String       @db.VarChar(100) // Pre-req
+  phone             String       @unique(map: "UK__user_phone") @db.VarChar(50)
+  email             String       @db.VarChar(100) // TODO: @unique(map: "UK__user_email")
+  password          String       @db.VarChar(20)
+  notes             String?      @db.VarChar(500)
+  access_level      access_level @default(client)
+  pan_id            String?      @db.VarChar(20)
+  aadhaar_id        String?      @db.VarChar(20)
+  permanent_address String?      @db.VarChar(500)
+
+  created_at    DateTime        @default(now())
+  created_by    String?
+  updated_at    DateTime        @default(now())
+  updated_by    String?
+  company_user  company_user[]
+  tokens        tokens[]
+  notifications notifications[]
+}
+
+model company {
+  id                  Int       @id @default(autoincrement())
+  // sp_id          Int?               @unique(map: "UK__site_sp_id")
+  name                String?   @db.VarChar(200)
+  branch_name         String?   @db.VarChar(50) // no-foreign-key relationship with smart_meter.id on purpose to avoid circular referencing
+  email               String?   @db.VarChar(100) // TODO: @unique(map: "UK__user_email")
+  start_date          DateTime?
+  end_date            DateTime?
+  location            String?
+  logo                String?   @db.VarChar(300)
+  parent_company_link Int?
+  address_link        Int?      
+  created_at          DateTime  @default(now())
+  created_by          String?
+  updated_at          DateTime  @default(now())
+  updated_by          String?
+
+  parent       company?       @relation("company_self_reference", fields: [parent_company_link], references: [id], map: "FK__parent_company")
+  children     company[]      @relation("company_self_reference")
+  address      address?       @relation(fields: [address_link], references: [id])
+  equipment    equipment[]
+  company_user company_user[]
+
+  @@unique([name, branch_name], name: "company_name_branch_name")
+}
+
+model company_user {
+  user_link    Int
+  company_link Int
+  assigned_at  DateTime @default(now())
+  role         String?  @db.VarChar(50)
+
+  user    user    @relation(fields: [user_link], references: [id])
+  company company @relation(fields: [company_link], references: [id])
+
+  @@id([user_link, company_link])
+}
+
+model address {
+  id           Int      @id@default(autoincrement())
+  lat          Decimal? @db.Decimal(10, 5)
+  long         Decimal? @db.Decimal(10, 5)
+  boundary     Json?
+  zoom_level   Decimal? @db.Decimal(10, 5)
+  address_line String?  @db.VarChar(255)
+  locality     String?  @db.VarChar(255)
+  district     String?  @db.VarChar(50)
+  city         String?  @db.VarChar(50)
+  state        String?  @db.VarChar(30)
+  country      String?  @db.VarChar(30)
+  pincode      String?  @db.VarChar(10)
+  ero_code     String?  @db.VarChar(30)
+  area_code    String?  @db.VarChar(30)
+
+  created_at DateTime  @default(now())
+  created_by String?
+  updated_at DateTime  @default(now())
+  updated_by String?
+  company    company[]
+
+  @@unique([lat, long, address_line, pincode], name: "address_lat_long_address_line_pincode_key")
+}
+
+enum access_level {
+  client
+  client_admin
+  technician
+  eg_admin
+  eg_super_admin
+  others
+}
+
+enum hold {
+  spare_required
+  expert_service_required
+  others
+}
+
+enum call_type {
+  amc_preventive_maintenance
+  breakdown
+  service
+}
+
+enum status {
+  open
+  hold
+  in_progress
+  closed
+}
+
+enum tm_frequency {
+  daily
+  weekly
+  biweekly
+  monthly
+  bi_monthly
+  tri_monthly
+  quarterly
+  semi_annual
+  annual
+}
+
+model equipment {
+  id                Int           @id @default(autoincrement())
+  name              String
+  make              String?
+  model             String?
+  eg_serial_number String @unique @map("eg_serial_number")
+  serial_number    String?                                
+  specifications    String?
+  image_url         String?
+  manufacturer_date DateTime?     @map("manufacturerDate")
+  location          String?
+  description       String?
+  tm_frequency      tm_frequency? @map("tmFrequency")
+  company           company?      @relation(fields: [company_link], references: [id])
+  company_link      Int?
+  tasks             tasks[]
+  manual            String?
+  created_at        DateTime      @default(now())
+  created_by        String?
+  updated_at        DateTime      @default(now())
+  updated_by        String?
+
+  @@unique([eg_serial_number, make, model], name: "equipment_eg_serial_number_make_model")
+}
+
+model tasks {
+  id                   Int           @id @default(autoincrement())
+  name                 String?
+  description          String?
+  call_type            call_type?
+  image                images[]
+  out_images           String?
+  equipment            equipment?    @relation(fields: [equipment_link], references: [id])
+  equipment_link       Int?
+  ticket_no            String        @unique(map: "UK__ticket_no")
+  otp                  String
+  feedback             String?
+  action_taken         String?
+  req_details          String?
+  follow_up            Boolean?
+  action_req_details   String?
+  service_satisfactory Boolean?
+  is_running_smoothly  Boolean?
+  notes                String?
+  rating               Int?
+  status               status?
+  task_user            task_user[]
+  created_at           DateTime      @default(now())
+  created_by           String?
+  updated_at           DateTime      @default(now())
+  updated_by           String?
+  hold_reason          hold_reason[]
+
+  @@unique([equipment_link, name, description, call_type], name: "tasks_equipment_link_name_description_call_type")
+}
+
+model images {
+  id      Int    @id @default(autoincrement())
+  url     String
+  taskId  Int
+  task    tasks  @relation(fields: [taskId], references: [id])
+}
+
+model hold_reason {
+  id                Int      @id @default(autoincrement())
+  hold              hold
+  is_active         Boolean @default(false)
+  spare_part_number String?
+  image             String?
+  reason            String?
+  created_at        DateTime @default(now())
+  created_by        String?
+  updated_at        DateTime @default(now())
+  updated_by        String?
+
+  task_link Int
+  task      tasks @relation(fields: [task_link], references: [id])
+
+  @@unique([hold, spare_part_number, task_link], name: "hold_spare_part_number_task_link_key")
+}
+
+model task_user {
+  id              Int      @id @default(autoincrement())
+  technician_link Int?
+  client_link     Int
+  task_link       Int
+  task            tasks    @relation(fields: [task_link], references: [id])
+  status          status   @default(open)
+  reason          String?
+  created_at      DateTime @default(now())
+  created_by      String?
+  updated_at      DateTime @default(now())
+  updated_by      String?
+
+  @@unique([technician_link, client_link, task_link, status], name: "task_user_technician_link_client_link_task_link_status")
+}
+
+model tokens {
+  id        Int    @id @default(autoincrement())
+  fcm_id    String
+  device_id String
+  user_link Int
+  user      user   @relation(fields: [user_link], references: [id])
+
+  created_at DateTime @default(now())
+  created_by String?
+  updated_at DateTime @default(now())
+  updated_by String?
+
+  @@unique([device_id, fcm_id, user_link])
+}
+
+model notifications {
+  id          Int     @id @default(autoincrement())
+  title       String
+  description String
+  image_url   String?
+  task_link   Int?
+  is_read     Boolean @default(false)
+  user_link   Int
+  user        user    @relation(fields: [user_link], references: [id])
+
+  created_at DateTime @default(now())
+  created_by String?
+  updated_at DateTime @default(now())
+  updated_by String?
+}

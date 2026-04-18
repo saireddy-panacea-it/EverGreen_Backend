@@ -1,0 +1,428 @@
+<!doctype html>
+<html>
+  <head>
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css"
+    />
+    <!-- <link href="https://fonts.cdnfonts.com/css/segoe-ui-4" rel="stylesheet" /> -->
+    <!-- <script src="https://cdn.tailwindcss.com"></script> -->
+    <style>
+      * {
+        font-family:
+          'Liberation Sans',
+          'DejaVu Sans',
+          -apple-system,
+          BlinkMacSystemFont,
+          Roboto,
+          'Helvetica Neue',
+          'Noto Sans',
+          Arial,
+          sans-serif;
+        color: #19324b;
+        font-size: small;
+      }
+      .bg-primary {
+        background-color: #19324b;
+      }
+      .text-orange {
+        color: #fa644b;
+      }
+      .section-header {
+        background-color: #19324b !important;
+        padding: 8px 12px !important;
+        margin-top: 18px !important;
+      }
+      .section-header p {
+        color: white;
+        font-weight: medium;
+        text-transform: uppercase;
+      }
+
+      .footer {
+        position: absolute;
+        bottom: 0;
+        width: 100%;
+        height: 2.5rem; /* Footer height */
+      }
+
+      td,
+      th {
+        padding: 4px 10px;
+      }
+      th {
+        font-weight: 600;
+        text-align: left;
+      }
+      table,
+      th,
+      td {
+        border: 1px solid lightgray;
+        border-collapse: collapse;
+      }
+      #bill-summary td:nth-child(n + 3),
+      #bill-summary th:nth-child(n + 3) {
+        background-color: #efefef;
+      }
+      #bill-summary td:nth-child(4),
+      #bill-summary th:nth-child(4) {
+        text-align: right;
+      }
+      table {
+        width: 100%;
+      }
+      .flex {
+        display: flex;
+      }
+      .flex {
+        display: flex;
+      }
+
+      .col-span-6 {
+        flex: 4; /* This will occupy 40% of the available space */
+        padding-right: 10px; /* Adjust padding as needed */
+      }
+
+      .col-span-6:last-child {
+        flex: 6; /* This will occupy 60% of the available space */
+      }
+
+      .response {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .response p {
+        margin: 0;
+      }
+
+      .action-taken-description {
+        margin-top: 8px;
+        padding: 8px;
+        border: 1px solid lightgray;
+      }
+
+      .flex-col {
+        flex-direction: column;
+      }
+      .justify-between {
+        justify-content: space-between;
+      }
+      .align-center {
+        align-items: center;
+      }
+      .bg-grey,
+      thead {
+        background-color: whitesmoke;
+      }
+      p {
+        margin: 0;
+      }
+      ul {
+        padding-left: 6px;
+        list-style-type: none;
+      }
+      .ml-auto {
+        margin-left: auto;
+      }
+      .text-left {
+        text-align: left;
+      }
+      .text-center {
+        text-align: center;
+      }
+      .text-right {
+        text-align: right;
+      }
+      .mt-4 {
+        margin-top: 12px;
+      }
+      .mt-8 {
+        margin-top: 24px;
+      }
+      .mb-4 {
+        margin-bottom: 12px;
+      }
+      .mb-8 {
+        margin-bottom: 24px;
+      }
+      .px-4 {
+        padding: 4px 10px;
+      }
+      .text-sm {
+        font-size: small;
+      }
+      .payment-options li {
+        margin-top: 2px;
+      }
+      .action-taken-description {
+        width: 100%;
+        border: 1px solid lightgray; /* Example border for visualization */
+        padding: 12px; /* Adjust padding as needed */
+        margin-top: 8px; /* Adjust margin as needed */
+        font-size: small;
+        line-height: 1.4;
+      }
+
+      section,
+      .no-page-break {
+        page-break-inside: avoid;
+        /* border: 1px solid red; */
+        /* margin-bottom: 48px; */
+      }
+      .font-medium,
+      .tax-info tr:last-child {
+        font-weight: 500;
+      }
+      .tax-info td,
+      th {
+        font-size: 12px;
+      }
+      .font-bold {
+        font-weight: bold;
+      }
+
+      .customer-response {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 8px;
+      }
+
+      .customer-response p {
+        margin: 0;
+        width: 70%;
+      }
+
+      .response {
+        width: 30%;
+        display: flex;
+        justify-content: flex-end;
+      }
+
+      .action-taken-description {
+        margin-top: 8px;
+        padding: 8px;
+        border: 1px solid lightgray;
+      }
+
+      .image-container {
+        display: flex;
+        justify-content: space-around;
+        align-items: center;
+        height: 100px; /* Adjust height as needed */
+      }
+      .image-container img {
+        width: 150px; /* Adjust width as needed */
+        height: 100px; /* Adjust height as needed */
+        object-fit: cover; /* Ensure images fit within their dimensions */
+      }
+      .section-header {
+        background-color: #19324b;
+        padding: 8px 12px;
+        margin-top: 18px;
+      }
+      .section-header p {
+        color: white;
+        font-weight: medium;
+        text-transform: uppercase;
+      }
+      .signature-section {
+        margin-top: 22px;
+        border: 1px solid lightgray;
+        padding: 6px;
+        width: 98%;
+        color: #19324b;
+        font-size: small;
+      }
+      #signature-box {
+        height: 52px;
+        background-color: white;
+      }
+    </style>
+  </head>
+
+  <body style="margin: 0px 48px; padding-bottom: 14px">
+    <div>
+      <header
+        style="
+          display: flex;
+          justify-content: space-between;
+          margin-bottom: 12px;
+        "
+      >
+        <img alt="" />
+        <p style="font-weight: bold; font-size: large">
+          EVER GREEN ENTERPRISES
+        </p>
+        <p style="font-weight: bold; font-size: smaller">Service Report</p>
+        <h3 style="font-weight: 500; font-size: 18px"></h3>
+      </header>
+      <section>
+        <div
+          class="flex section-header justify-between mt-4"
+          style="background-color: #19324b"
+        >
+          <p class="col-span-4">BILL TO:</p>
+          <p class="w-72">Contact Info:</p>
+        </div>
+        <div class="px-4 flex justify-between">
+          <div class="col-span-4">
+            <p><%= bill_to.name%></p>
+            <p><%= bill_to.location%></p>
+          </div>
+          <div class="col-span-4">
+            <p><strong>Contact Person:</strong> <%= contact_info.contact_person%></p>
+            <p><strong>Phone:</strong> <%= contact_info.phone%></p>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div class="flex section-header justify-between mt-8">
+          <p class="col-span-4">Equipment Details</p>
+        </div>
+        <table id="bill-summary" class="border">
+          <tr>
+            <th>Service Report #:</th>
+            <td><%= equipment_details.service_report%></td>
+            <th>Date</th>
+            <td><%= equipment_details.date%></td>
+          </tr>
+          <tr>
+            <th>Name</th>
+            <td><%= equipment_details.name%></td>
+            <th>Location</th>
+            <td><%= equipment_details.location%></td>
+          </tr>
+          <tr>
+            <th>Model No:</th>
+            <td><%= equipment_details.model%></td>
+            <th>Sl. No:</th>
+            <td><%= equipment_details.serial_no%></td>
+          </tr>
+          <tr>
+            <th>Voltage:</th>
+            <td><%= equipment_details.make%></td>
+            <th>Call Type (AMC / BREAKDOWN / SERVICE)</th>
+            <td><%= equipment_details.call_type%></td>
+          </tr>
+        </table>
+      </section>
+
+      <section>
+        <div class="flex section-header justify-between mt-4">
+          <p class="col-span-4">Action Taken</p>
+        </div>
+        <div class="action-taken-description">
+          <!-- Dynamic content using EJS -->
+          <%= action_taken%>
+        </div>
+      </section>
+
+      <section>
+        <div class="flex section-header justify-between mt-4">
+          <p class="col-span-4">Requirement</p>
+        </div>
+        <div class="action-taken-description">
+          <!-- Dynamic content using EJS -->
+          <%= requirement%>
+        </div>
+      </section>
+
+      <section>
+        <div class="flex section-header justify-between mt-4">
+          <p class="col-span-4">Action Taken</p>
+        </div>
+        <div class="px-4 flex justify-between">
+          <div class="col-span-4">
+            <p>Action Taken(Yes/No):  <%= follow_up%></p>
+            <div class="action-taken-description">
+              <!-- Dynamic content using EJS -->
+              <%= action_req_details%>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div class="flex section-header justify-between mt-4">
+          <p class="col-span-4">To be filled by Customer</p>
+        </div>
+        <div class="px-5 flex">
+          <div class="col-span-6">
+            <p>The machine has been serviced / repaired to my satisfaction</p>
+            <p>The machine is running smoothly and satisfactorily</p>
+            <p>Any Other Comments</p>
+          </div>
+          <div class="col-span-6">
+            <div class="response">
+              <p><%= filled_by_cust.service_satisfactory%></p>
+              <p><%= filled_by_cust.is_running_smoothly%></p>
+            </div>
+            <div class="action-taken-description">
+              <%= filled_by_cust.notes%>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div class="flex section-header justify-between mt-8">
+          <p class="col-span-4">Service Report Images</p>
+        </div>
+
+        <div class="flex justify-between mt-4">
+          <img src="<%= service_report_images.image_1%>" alt="Image 1" height="80" width="80" />
+          <img src="<%= service_report_images.image_2%>" alt="Image 2" height="80" width="80" />
+          <img src="<%= service_report_images.image_3%>" alt="Image 3" height="80" width="80" />
+        </div>
+      </section>
+
+      <div class="signature-section">
+        <p class="text-sm"><%= contact_info.contact_person%></p>
+        <div id="signature-box">
+          <img src="<%= signature%>" alt="Signature" height="50px" width="120px">
+        </div>
+        <p class="text-sm">
+          <i
+            >This is an electronically signed document; physical signature is
+            not required.</i
+          >
+        </p>
+      </div>
+    </div>
+  </body>
+  <!-- footer: -->
+  <!-- <footer id="footer" class="flex mt-0" style="position: absolute; bottom: 0">
+    <img
+      src="logo2.png"
+      alt=""
+      width="32px"
+      height="31px"
+      style="
+        width: 30px;
+        height: 30px;
+        margin: auto 0;
+        margin-right: 50px;
+        margin-left: 0px;
+      "
+    />
+    <div>
+      <p style="font-weight: bold">EVER GREEN ENTERPRISES</p>
+      <p style="font-size: x-small">
+        Imported and Indian Equipment Spares and Service,
+      </p>
+      <p style="font-size: x-small">
+        Plot No. 7-2-4712, Industrial Housing Colony, Sanathnagar, Hyderabad,
+        Telangana - 500018
+      </p>
+    </div>
+    <div style="text-align: right; padding-right: 10px">
+      <p>For any queries, reach us @</p>
+      <p style="font-size: x-small">
+        Email us: evergreenenterprises@gmail.com, service@egeservices.in
+      </p>
+      <p style="font-size: x-small">9052377567, 9700185859</p>
+    </div>
+  </footer> -->
+</html>

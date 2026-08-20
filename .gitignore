@@ -1,3 +1,4 @@
 node_modules/
-dist/\
+dist/
 .env
+src/firebase/firebase-creds.json

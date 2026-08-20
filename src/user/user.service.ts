@@ -34,9 +34,6 @@ import axios from "axios";
 @Injectable()
 export class UserService {
   constructor(private readonly firebaseService: FirebaseService) {}
-
-  private readonly fcmUrl = "https://fcm.googleapis.com/fcm/send";
-  private readonly serverKey = process.env.FIREBASE_SERVER_KEY;
   async createUser(res, req) {
     const user: user = {
       id: undefined,

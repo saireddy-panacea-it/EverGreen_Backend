@@ -9,6 +9,8 @@ import { UserService } from './user/user.service';
 import { FirebaseService } from './firebase/firebase.service';
 import { ConfigModule } from '@nestjs/config';
 import { AuthModule } from './auth/auth.module';
+import { NotificationModule } from './notification/notification.module';
+import { NotificationService } from './notification/notification.service';
 
 @Module({
   imports: [
@@ -17,12 +19,13 @@ import { AuthModule } from './auth/auth.module';
       serveRoot: '/uploads',
     }),
     UserModule,
+    NotificationModule,
     ConfigModule.forRoot({
       isGlobal: true,
     }),
     AuthModule,
   ],
   controllers: [AppController, UserController],
-  providers: [AppService, UserService, FirebaseService],
+  providers: [AppService, UserService, FirebaseService, NotificationService],
 })
 export class AppModule {}

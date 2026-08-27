@@ -7,6 +7,7 @@ import {
   access_level,
   tm_frequency,
   task_user,
+  call_type,
 } from "@prisma/client";
 import * as crypto from "crypto";
 import puppeteer from "puppeteer";
@@ -27,13 +28,17 @@ import fs from "fs";
 const prisma = new PrismaClient();
 import nodemailer from "nodemailer";
 import { FirebaseService } from "../firebase/firebase.service"; // Update the import path as necessary
+import { NotificationService } from "../notification/notification.service";
 import serviceReportTemplate from "../service_report/service_report"; // billInvoice
 import * as ejs from "ejs";
 import axios from "axios";
 
 @Injectable()
 export class UserService {
-  constructor(private readonly firebaseService: FirebaseService) {}
+  constructor(
+    private readonly firebaseService: FirebaseService,
+    private readonly notificationService: NotificationService,
+  ) {}
   async createUser(res, req) {
     const user: user = {
       id: undefined,
@@ -93,6 +98,22 @@ export class UserService {
             });
           }
         }
+      }
+
+      try {
+        await this.notificationService.sendCredentialsEmail(dbUser);
+        if (String(dbUser.access_level).toLowerCase() === "technician") {
+          const actor = await this.findOne(req.user?.phone);
+          await this.notificationService.onNewTechnician({
+            technicianName: dbUser.name,
+            companyLink: companyLinks?.length
+              ? parseInt(companyLinks[0], 10)
+              : undefined,
+            actorUserId: actor?.id,
+          });
+        }
+      } catch (notifyError) {
+        console.error("createUser notification failed", notifyError);
       }
 
       return res.status(200).send({
@@ -274,6 +295,17 @@ export class UserService {
           user_link: dbUser.id,
         },
       });
+
+      try {
+        await this.notificationService.sendCredentialsEmail(dbUser);
+        await this.notificationService.onNewAmc({
+          companyName: dbCompany.name,
+          managerName: dbUser.name,
+          location: dbCompany.location,
+        });
+      } catch (notifyError) {
+        console.error("createCompany notification failed", notifyError);
+      }
 
       return res.status(200).send({
         message: `company created successfully`,
@@ -708,22 +740,19 @@ export class UserService {
       });
 
       const user = await this.findOne(userPhone);
-      const tokens = await this.getTokens(dbEquipment.company_link, [
-        access_level.technician,
-      ]);
-      const title = `New issue raised by ${user.name ?? user.phone} from company: ${dbEquipment.company.name}`;
-      const data = {
-        title,
-        name: dbTask.name,
-        task_link: dbTask.id?.toString(),
-        description: dbTask.description,
-        serial_number: dbEquipment.eg_serial_number,
-        location: dbEquipment.location,
-        image_url: "",
-        channel_id: "evergreen",
-      };
-
-      await this.sendNotification(tokens, title, data);
+      try {
+        await this.notificationService.onNewTask({
+          task: dbTask,
+          equipment: dbEquipment,
+          raisedByName: user?.name ?? user?.phone,
+          companyName: dbEquipment.company?.name,
+          companyLink: dbEquipment.company_link,
+          isHighPriority: dbTask.call_type === call_type.breakdown,
+          actorUserId: user?.id,
+        });
+      } catch (notifyError) {
+        console.error("createTask notification failed", notifyError);
+      }
       const taskStatus = await this.getLatestStatusForTask(dbTask.id);
 
       return res.status(200).send({
@@ -918,6 +947,31 @@ export class UserService {
           message: `technician assigned successfully`,
           status: 200,
         };
+        try {
+          const assignedTask = await prisma.tasks.findUnique({
+            where: { id: req.body.task_link },
+            include: {
+              equipment: { include: { company: true } },
+            },
+          });
+          const technician = await prisma.user.findUnique({
+            where: { id: req.body.technician_link },
+          });
+          const actor = await this.findOne(userPhone);
+          await this.notificationService.onTechnicianAssigned({
+            task: assignedTask,
+            equipment: assignedTask?.equipment,
+            companyLink: assignedTask?.equipment?.company_link,
+            companyName: assignedTask?.equipment?.company?.name,
+            technicianName: technician?.name ?? technician?.phone,
+            technicianUserId: req.body.technician_link,
+            assignedByUserId: actor?.id,
+            assignedByName: actor?.name ?? actor?.phone,
+            selfAssigned: actor?.id === req.body.technician_link,
+          });
+        } catch (notifyError) {
+          console.error("assignTechnician notification failed", notifyError);
+        }
       } else {
         response = {
           message: `technician already assigned`,
@@ -1022,23 +1076,21 @@ export class UserService {
         status: 200,
       };
 
-      // send notification;
-      const tokens = await this.getTokens(
-        dbTaskUser.task.equipment.company_link,
-        [access_level.client, access_level.client_admin]
-      );
-
-      const title = `Task status got updated successfully to ${taskStatus} by ${userInfo.name} from company: ${dbTaskUser.task.equipment.company.name}`;
-      const data = {
-        title,
-        name: dbTask.name,
-        task_link: dbTask.id?.toString(),
-        description: dbTask.description,
-        serial_number: dbTaskUser.task.equipment.eg_serial_number,
-        location: dbTaskUser.task.equipment.location,
-        image_url: "",
-      };
-      await this.sendNotification(tokens, title, data);
+      try {
+        await this.notificationService.onTaskStatusUpdated({
+          task: dbTask,
+          equipment: dbTaskUser.task.equipment,
+          companyLink: dbTaskUser.task.equipment.company_link,
+          companyName: dbTaskUser.task.equipment.company?.name,
+          statusLabel: String(taskStatus),
+          updatedByName: userInfo?.name ?? userInfo?.phone,
+          actorUserId: userInfo?.id,
+          notes: req.body.reason,
+          isCompleted: taskStatus === status.closed,
+        });
+      } catch (notifyError) {
+        console.error("updateTaskStatus notification failed", notifyError);
+      }
     }
 
     const taskLatestStatus = await this.getLatestStatusForTask(dbTask.id);
@@ -1624,6 +1676,56 @@ export class UserService {
           data: updateTask,
           status: 200,
         };
+        try {
+          const actor = await this.findOne(req.user?.phone);
+          const latestAssignment = await prisma.task_user.findFirst({
+            where: { task_link: req.body.task_link },
+            orderBy: { id: "desc" },
+          });
+          const equipment = await prisma.equipment.findUnique({
+            where: { id: task.equipment_link },
+            include: { company: true },
+          });
+          const hasNotes = Boolean(
+            req.body.action_taken ||
+              req.body.req_details ||
+              req.body.action_req_details ||
+              req.body.notes,
+          );
+          const hasFeedback = Boolean(
+            req.body.feedback ||
+              req.body.rating != null ||
+              req.body.service_satisfactory != null ||
+              req.body.is_running_smoothly != null,
+          );
+          if (hasNotes) {
+            await this.notificationService.onTaskNotesUpdated({
+              task: updateTask,
+              equipment,
+              companyLink: equipment?.company_link,
+              updatedByName: actor?.name ?? actor?.phone,
+              actorUserId: actor?.id,
+              notes:
+                req.body.action_taken ||
+                req.body.notes ||
+                req.body.req_details,
+            });
+          }
+          if (hasFeedback) {
+            await this.notificationService.onFeedback({
+              task: updateTask,
+              equipment,
+              companyLink: equipment?.company_link,
+              technicianUserId: latestAssignment?.technician_link,
+              actorUserId: actor?.id,
+              submittedByName: actor?.name ?? actor?.phone,
+              feedback: req.body.feedback,
+              rating: req.body.rating,
+            });
+          }
+        } catch (notifyError) {
+          console.error("updateTaskFeedback notification failed", notifyError);
+        }
       } else {
         response = {
           message: `task not updated successfully`,

@@ -490,7 +490,7 @@ export class UserService {
     try {
       const companyId = parseInt(String(req.body.company_link ?? ""), 10);
       if (isNaN(companyId)) {
-        return res.send({
+        return res.status(HttpStatus.BAD_REQUEST).send({
           message: "Invalid company id",
           status: HttpStatus.BAD_REQUEST,
         });
@@ -501,23 +501,24 @@ export class UserService {
         where: { id: companyId },
       });
       if (!existingCompany) {
-        return res.send({
+        return res.status(HttpStatus.NOT_FOUND).send({
           message: "company not found",
           status: HttpStatus.NOT_FOUND,
         });
       }
 
       const isAdmin = this.adminOrNot(userInfo?.access_level);
+      const requestUserId = parseInt(String(req.user.sub ?? ""), 10);
       if (!isAdmin) {
         const isLinked = await prisma.company_user.findFirst({
           where: {
             company_link: companyId,
-            user_link: req.user.sub,
+            user_link: requestUserId,
           },
         });
         const isCreator = existingCompany.created_by === req.user.phone;
         if (!isLinked && !isCreator) {
-          return res.send({
+          return res.status(HttpStatus.FORBIDDEN).send({
             message: "You do not have access to delete this company",
             status: HttpStatus.FORBIDDEN,
           });
@@ -540,6 +541,12 @@ export class UserService {
         : [];
       const taskIds = linkedTasks.map((x) => x.id);
 
+      const linkedCompanyUsers = await prisma.company_user.findMany({
+        where: { company_link: companyId },
+        select: { user_link: true },
+      });
+      const linkedUserIds = linkedCompanyUsers.map((x) => x.user_link);
+
       await prisma.$transaction(async (tx) => {
         if (taskIds.length > 0) {
           await tx.images.deleteMany({
@@ -559,15 +566,46 @@ export class UserService {
           });
         }
 
+        if (linkedUserIds.length > 0) {
+          await tx.notifications.deleteMany({
+            where: { user_link: { in: linkedUserIds } },
+          });
+          await tx.tokens.deleteMany({
+            where: { user_link: { in: linkedUserIds } },
+          });
+        }
+
         if (equipmentIds.length > 0) {
           await tx.equipment.deleteMany({
             where: { id: { in: equipmentIds } },
           });
         }
 
+        await tx.company.updateMany({
+          where: { parent_company_link: companyId },
+          data: { parent_company_link: null },
+        });
+
         await tx.company_user.deleteMany({
           where: { company_link: companyId },
         });
+
+        if (linkedUserIds.length > 0) {
+          const orphanClientAdmins = await tx.user.findMany({
+            where: {
+              id: { in: linkedUserIds },
+              access_level: access_level.client_admin,
+              company_user: { none: {} },
+            },
+            select: { id: true },
+          });
+          const orphanUserIds = orphanClientAdmins.map((user) => user.id);
+          if (orphanUserIds.length > 0) {
+            await tx.user.deleteMany({
+              where: { id: { in: orphanUserIds } },
+            });
+          }
+        }
 
         await tx.company.delete({
           where: { id: companyId },
@@ -579,9 +617,10 @@ export class UserService {
         message: "company deleted successfully",
       });
     } catch (error) {
-      return res.send({
-        message: `something went wrong ${error}`,
-        status: 204,
+      console.error("deleteCompany failed", error);
+      return res.status(HttpStatus.INTERNAL_SERVER_ERROR).send({
+        message: "Unable to delete company. Please try again.",
+        status: HttpStatus.INTERNAL_SERVER_ERROR,
       });
     }
   }

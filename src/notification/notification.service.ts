@@ -63,10 +63,16 @@ export class NotificationService {
     }
 
     const globalLevels = levels.filter(
-      (level) => level === ROLE.ADMIN || level === ROLE.MANAGER,
+      (level) =>
+        level === ROLE.ADMIN ||
+        level === ROLE.MANAGER ||
+        level === ROLE.TECHNICIAN,
     );
     const companyLevels = levels.filter(
-      (level) => level !== ROLE.ADMIN && level !== ROLE.MANAGER,
+      (level) =>
+        level !== ROLE.ADMIN &&
+        level !== ROLE.MANAGER &&
+        level !== ROLE.TECHNICIAN,
     );
 
     const users: { id: number; email: string | null }[] = [];

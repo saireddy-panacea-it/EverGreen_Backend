@@ -278,6 +278,26 @@ export class UserController {
     return await this.userService.uploadEquipmentData(res, req, file);
   }
 
+  @Post("uploadCompanyData")
+  @UseInterceptors(FileInterceptor("file"))
+  async uploadCompanyData(
+    @Res() res: Response,
+    @Req() req: Request,
+    @UploadedFile() file
+  ) {
+    return await this.userService.uploadCompanyData(res, req, file);
+  }
+
+  @Post("uploadTechnicianData")
+  @UseInterceptors(FileInterceptor("file"))
+  async uploadTechnicianData(
+    @Res() res: Response,
+    @Req() req: Request,
+    @UploadedFile() file
+  ) {
+    return await this.userService.uploadTechnicianData(res, req, file);
+  }
+
   // @Post(':destination')
   // @UseInterceptors(
   //   FileInterceptor('file', {

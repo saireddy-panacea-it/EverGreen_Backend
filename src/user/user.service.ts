@@ -1,4 +1,4 @@
-import { HttpStatus, Injectable } from "@nestjs/common";
+import { HttpStatus, Injectable, Logger } from "@nestjs/common";
 import {
   PrismaClient,
   equipment,
@@ -18,7 +18,9 @@ import {
   mapStatusToEnum,
 } from "src/common";
 
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, writeFileSync, readFileSync } from "fs";
+import * as path from "path";
+import { buildServiceReportPdf } from "../service_report/build_pdf";
 // exceljs is CommonJS; default import is undefined at runtime (Workbook crash)
 const ExcelJS = require("exceljs");
 import * as moment from "moment";
@@ -35,6 +37,8 @@ import axios from "axios";
 
 @Injectable()
 export class UserService {
+  private readonly logger = new Logger(UserService.name);
+
   constructor(
     private readonly firebaseService: FirebaseService,
     private readonly notificationService: NotificationService,
@@ -93,7 +97,13 @@ export class UserService {
     });
 
     if (dbUser != null) {
-      const companyLinks = req.body.company_link;
+      const companyLinks = this.isTechnicianRole(req.body.access_level)
+        ? []
+        : Array.isArray(req.body.company_link)
+          ? req.body.company_link
+          : req.body.company_link != null
+            ? [req.body.company_link]
+            : [];
       console.log(companyLinks);
       if (companyLinks?.length > 0) {
         for (const companyLink of companyLinks) {
@@ -867,6 +877,34 @@ export class UserService {
     }
 
     return false;
+  }
+
+  attachedCompanyIds(userInfo): number[] {
+    return (userInfo?.company_user || [])
+      .map((link) => link.company_link)
+      .filter((id) => id != null);
+  }
+
+  isTechnicianRole(level): boolean {
+    return (
+      level === access_level.technician ||
+      String(level || "").toLowerCase() === "technician"
+    );
+  }
+
+  coerceRating(value): number | undefined {
+    if (value == null || value === "") return undefined;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return undefined;
+    return Math.max(0, Math.min(5, Math.round(parsed)));
+  }
+
+  canAccessCompany(userInfo, companyLink): boolean {
+    if (!userInfo) return false;
+    if (this.adminOrNot(userInfo.access_level)) return true;
+    if (userInfo.access_level === access_level.technician) return true;
+    const requested = parseInt(String(companyLink ?? ""), 10);
+    return this.attachedCompanyIds(userInfo).includes(requested);
   }
 
   async createEquipment(res, req) {
@@ -1752,53 +1790,250 @@ export class UserService {
     });
   }
 
+  async resolveTaskLink(rawId) {
+    const id = parseInt(String(rawId ?? ""), 10);
+    if (Number.isNaN(id)) return null;
+    const task = await prisma.tasks.findUnique({ where: { id }, select: { id: true } });
+    if (task) return task.id;
+    const taskUser = await prisma.task_user.findUnique({
+      where: { id },
+      select: { task_link: true },
+    });
+    return taskUser?.task_link ?? null;
+  }
+
   async clientSignatureForReport(res, req) {
     try {
-      // const sign_url = "https://www.shutterstock.com/image-vector/fake-autograph-samples-handdrawn-signatures-260nw-2325821623.jpg";
-      const task_link = req.body.task_link;
-      const taskDetails = await this.getTaskDetails(task_link);
-      taskDetails["signature"] = await this.urlToBase64(req.body.sign_url);
-      taskDetails.service_report_images.image_1 = await this.urlToBase64(
-        taskDetails.service_report_images.image_1
+      const requester = await this.findOne(req.user.phone);
+      const taskLink = await this.resolveTaskLink(
+        req.body.task_link ?? req.body.task_user_link
       );
-      taskDetails.service_report_images.image_2 = await this.urlToBase64(
-        taskDetails.service_report_images.image_2
-      );
-      taskDetails.service_report_images.image_3 = await this.urlToBase64(
-        taskDetails.service_report_images.image_3
-      );
-      const report = await ejs.render(serviceReportTemplate, taskDetails);
-      const pdfBuffer = await this.getPDFBufferFromHtml(report);
-      const filePath = `./uploads/reports/file-${task_link}.pdf`;
+      if (!taskLink) {
+        return res.status(400).send({
+          status: 400,
+          message: "task_link is required",
+        });
+      }
 
-      fs.access(filePath, fs.constants.F_OK, (err) => {
-        if (err) {
-          // File does not exist, proceed with writing the file
-          fs.writeFile(filePath, pdfBuffer, (writeErr) => {
-            if (writeErr) {
-              return res.send({
-                status: 401,
-                message: `Error writing file`,
-                url: filePath,
-              });
-            }
-            return res.send({
-              status: 200,
-              message: `file generated successfully`,
-            });
-          });
-        } else {
-          return res.send({
-            status: 200,
-            message: `File already exists`,
-            url: filePath,
-          });
+      const approvalSaved = await this.saveClientApproval(taskLink, req, requester);
+      if (approvalSaved?.error) {
+        return res.status(approvalSaved.error.status).send(approvalSaved.error);
+      }
+
+      let reportFile = null;
+      try {
+        const signature = await this.imageToDataUrl(req.body.sign_url);
+        if (req.body.sign_url) {
+          await this.persistSignatureFile(taskLink, req.body.sign_url);
         }
+        const view = await this.buildServiceReportView(
+          taskLink,
+          requester,
+          signature
+        );
+        if (!view.error) {
+          reportFile = await this.writeServiceReportPdf(taskLink, view, false);
+        } else {
+          this.logger.warn(
+            `Service report view failed for task ${taskLink}: ${view.error.message}`
+          );
+        }
+      } catch (reportError) {
+        this.logger.error("Service report PDF failed after approval", reportError);
+      }
+
+      return res.status(200).send({
+        status: 200,
+        message: reportFile
+          ? "Client approval saved and service report generated"
+          : "Client approval saved. Service report will be available shortly",
+        url: reportFile?.url,
       });
     } catch (error) {
-      console.error("Error converting HTML to PDF:", error);
-      res.status(500).json({ error: "Failed to convert HTML to PDF" });
+      this.logger.error("clientSignatureForReport failed", error);
+      return res.status(500).send({
+        status: 500,
+        message: "Failed to save client approval",
+      });
     }
+  }
+
+  async saveClientApproval(taskLink, req, requester) {
+    const task = await prisma.tasks.findUnique({
+      where: { id: taskLink },
+      include: { equipment: true },
+    });
+    if (!task) {
+      return { error: { status: 404, message: "Task not found" } };
+    }
+    if (!this.canAccessCompany(requester, task.equipment?.company_link)) {
+      return {
+        error: {
+          status: 403,
+          message: "You can only approve tasks for your attached company",
+        },
+      };
+    }
+
+    const rating = this.coerceRating(req.body.rating);
+    const hasApprovalFields =
+      req.body.feedback != null ||
+      req.body.service_satisfactory != null ||
+      req.body.is_running_smoothly != null ||
+      req.body.rating != null;
+
+    if (hasApprovalFields) {
+      await prisma.tasks.update({
+        where: { id: taskLink },
+        data: {
+          feedback: req.body.feedback ?? undefined,
+          service_satisfactory:
+            req.body.service_satisfactory ?? undefined,
+          is_running_smoothly:
+            req.body.is_running_smoothly ?? undefined,
+          rating,
+          updated_at: new Date(),
+          updated_by: req.user?.phone,
+        },
+      });
+    }
+
+    const latest = await prisma.task_user.findFirst({
+      where: { task_link: taskLink },
+      orderBy: { id: "desc" },
+    });
+    if (latest && latest.status !== status.closed) {
+      await prisma.task_user.update({
+        where: { id: latest.id },
+        data: {
+          status: status.closed,
+          updated_by: req.user?.phone,
+          updated_at: new Date(),
+        },
+      });
+    }
+
+    return { ok: true };
+  }
+
+  private resolveLocalUploadPath(raw?: string): string | null {
+    if (!raw) return null;
+    let rel = String(raw).trim();
+    try {
+      if (/^https?:\/\//i.test(rel)) {
+        rel = new URL(rel).pathname;
+      }
+    } catch {
+      // keep original
+    }
+    rel = rel.replace(/^\/+/, "");
+    const candidates = [rel, `./${rel}`, path.join(process.cwd(), rel)];
+    for (const candidate of candidates) {
+      if (candidate && existsSync(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  private async imageToDataUrl(imageUrl?: string) {
+    if (!imageUrl) return undefined;
+    const localPath = this.resolveLocalUploadPath(imageUrl);
+    if (localPath) {
+      const buffer = readFileSync(localPath);
+      const mime = buffer[0] === 0x89 ? "image/png" : "image/jpeg";
+      return `data:${mime};base64,${buffer.toString("base64")}`;
+    }
+    try {
+      const absolute = /^https?:\/\//i.test(imageUrl)
+        ? imageUrl
+        : `${String(process.env.BASE_URL || "").replace(/\/$/, "")}/${String(imageUrl).replace(/^\//, "")}`;
+      const response = await axios.get(absolute, {
+        responseType: "arraybuffer",
+        timeout: 8000,
+      });
+      return `data:image/jpeg;base64,${Buffer.from(response.data).toString("base64")}`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async buildLocalServiceReportView(taskLink, signUrl?: string) {
+    const task = await prisma.tasks.findUnique({
+      where: { id: taskLink },
+      include: {
+        task_user: { orderBy: { created_at: "asc" } },
+        equipment: { include: { company: true } },
+      },
+    });
+    const latest = task?.task_user?.[task.task_user.length - 1];
+    const client = latest?.client_link
+      ? await prisma.user.findUnique({ where: { id: latest.client_link } })
+      : null;
+    const technician = latest?.technician_link
+      ? await prisma.user.findUnique({ where: { id: latest.technician_link } })
+      : null;
+    const savedSign = `./uploads/reports/sign-${taskLink}.png`;
+    const signature = existsSync(savedSign)
+      ? await this.imageToDataUrl(savedSign)
+      : await this.imageToDataUrl(signUrl);
+    return {
+      ticket_no: task?.ticket_no,
+      generated_at: moment().format("DD MMM YYYY, hh:mm A"),
+      current_status: latest?.status === "closed" ? "Closed" : latest?.status || "Open",
+      status_key: latest?.status || "open",
+      is_closed: latest?.status === "closed",
+      created_at: task?.created_at,
+      created_by: task?.created_by,
+      call_type: task?.call_type,
+      task_name: task?.name,
+      task_description: task?.description,
+      company: {
+        name: task?.equipment?.company?.name,
+        branch: task?.equipment?.company?.branch_name,
+        location: task?.equipment?.company?.location,
+        email: task?.equipment?.company?.email,
+      },
+      contact: {
+        name: client?.name,
+        phone: client?.phone,
+        email: client?.email,
+      },
+      technician: {
+        name: technician?.name,
+        phone: technician?.phone,
+        note: technician ? "Assigned technician" : "No technician assigned yet",
+      },
+      equipment: {
+        name: task?.equipment?.name,
+        make: task?.equipment?.make,
+        model: task?.equipment?.model,
+        serial_no: task?.equipment?.serial_number,
+        eg_serial: task?.equipment?.eg_serial_number,
+        location: task?.equipment?.location,
+      },
+      timeline: [],
+      action_taken: task?.action_taken,
+      requirement: task?.req_details,
+      follow_up: task?.follow_up == null ? "-" : task.follow_up ? "Yes" : "No",
+      action_req_details: task?.action_req_details,
+      customer: {
+        service_satisfactory:
+          task?.service_satisfactory == null
+            ? "-"
+            : task.service_satisfactory
+              ? "Yes"
+              : "No",
+        is_running_smoothly:
+          task?.is_running_smoothly == null
+            ? "-"
+            : task.is_running_smoothly
+              ? "Yes"
+              : "No",
+        notes: task?.feedback || task?.notes,
+        rating: task?.rating != null ? `${task.rating} / 5` : "-",
+      },
+      images: [],
+      signature: signature || "",
+    };
   }
 
   private async urlToBase64(imageUrl: string) {
@@ -1825,29 +2060,31 @@ export class UserService {
 
   async getServiceReport(res, req) {
     try {
-      const task_link = req.body.task_link;
-      const filePath = `./uploads/reports/file-${task_link}.pdf`;
-
-      // Check if the file exists
-      fs.access(filePath, fs.constants.F_OK, (err) => {
-        if (err) {
-          // File does not exist
-          return res.send({
-            status: 401,
-            message: `client signature is not done or file not found`,
-          });
-        } else {
-          return res.send({
-            status: 200,
-            message: `file generated successfully`,
-            url: `uploads/reports/file-${task_link}.pdf`,
-          });
-        }
+      const taskLink = await this.resolveTaskLink(req.body.task_link);
+      if (!taskLink) {
+        return res.status(400).send({
+          status: 400,
+          message: "task_link is required",
+        });
+      }
+      const view = await this.buildLocalServiceReportView(taskLink, req.body.sign_url);
+      if (!existsSync("./uploads/reports")) {
+        mkdirSync("./uploads/reports", { recursive: true });
+      }
+      const pdfBuffer = Buffer.from(await buildServiceReportPdf(view));
+      const filePath = `./uploads/reports/file-${taskLink}.pdf`;
+      writeFileSync(filePath, pdfBuffer);
+      return res.status(200).send({
+        status: 200,
+        message: "Service report generated successfully",
+        url: `uploads/reports/file-${taskLink}.pdf`,
+        pdf_base64: pdfBuffer.toString("base64"),
       });
     } catch (error) {
-      return res.send({
-        status: 401,
-        message: `${error}`,
+      console.error("getServiceReport failed", error);
+      return res.status(500).send({
+        status: 500,
+        message: "Unable to generate service report",
       });
     }
   }
@@ -2025,12 +2262,13 @@ export class UserService {
 
     const filteredTasks = taskUsers.filter((task) => {
       const isTechnicianLinkValid = task.technician_link == null;
-      const myTask = task.technician_link == user.sub;
+      const actorId = parseInt(String(userInfo?.id ?? user.sub ?? ""), 10);
+      const myTask = task.technician_link == actorId;
       const isCompanyLinked = companyLinks.includes(
         task.task.equipment.company_link
       );
       if (userInfo.access_level == access_level.technician) {
-        return myTask || (isCompanyLinked && isTechnicianLinkValid);
+        return myTask || isTechnicianLinkValid;
       } else if (
         userInfo.access_level == access_level.client ||
         userInfo.access_level == access_level.client_admin
@@ -2181,18 +2419,20 @@ export class UserService {
           id: req.body.task_link,
         },
         data: {
-          call_type: mapCallTypeToEnum(req.body.call_type),
+          call_type: req.body.call_type
+            ? mapCallTypeToEnum(req.body.call_type)
+            : undefined,
           action_taken: req.body.action_taken ?? undefined,
           req_details: req.body.req_details ?? undefined,
           follow_up: req.body.follow_up ?? undefined,
           out_images: Array.isArray(req.body.out_images)
             ? JSON.stringify(req.body.out_images)
-            : req.body.out_images,
+            : req.body.out_images ?? undefined,
           action_req_details: req.body.action_req_details ?? undefined,
           service_satisfactory: req.body.service_satisfactory ?? undefined,
           is_running_smoothly: req.body.is_running_smoothly ?? undefined,
           feedback: req.body.feedback ?? undefined,
-          rating: req.body.rating ?? undefined,
+          rating: this.coerceRating(req.body.rating),
           updated_at: new Date(),
           updated_by: req.user.phone,
         },
@@ -2586,6 +2826,266 @@ export class UserService {
       return res.status(200).send({
         status: HttpStatus.CONFLICT,
         message: `Failed to upload data ${e}`,
+      });
+    }
+  }
+
+  private async loadExcelRows(file) {
+    if (!file?.buffer) {
+      return { error: "No Excel file received", rows: [] };
+    }
+    const WorkbookCtor = ExcelJS?.Workbook || ExcelJS?.default?.Workbook;
+    if (!WorkbookCtor) {
+      return { error: "Excel parser is not available on server", rows: [] };
+    }
+    const workBook = new WorkbookCtor();
+    await workBook.xlsx.load(file.buffer);
+    const rows: Array<{ rowNumber: number; sheet: string; record: Record<string, any> }> = [];
+    const errors: string[] = [];
+    for (const worksheet of workBook.worksheets || []) {
+      const headerMap = new Map<number, string>();
+      worksheet.getRow(1).eachCell((cell, colNumber) => {
+        const key = this.excelHeaderKey(cell.value);
+        if (key) headerMap.set(colNumber, key);
+      });
+      if (headerMap.size === 0) {
+        errors.push(`Sheet ${worksheet.name}: missing header row`);
+        continue;
+      }
+      const lastRow = Math.max(worksheet.rowCount || 0, worksheet.actualRowCount || 0);
+      for (let rowNumber = 2; rowNumber <= lastRow; rowNumber++) {
+        const row = worksheet.getRow(rowNumber);
+        const record: Record<string, any> = {};
+        row.eachCell((cell, colNumber) => {
+          const key = headerMap.get(colNumber);
+          if (key) record[key] = cell.value;
+        });
+        rows.push({ rowNumber, sheet: worksheet.name, record });
+      }
+    }
+    return { rows, errors };
+  }
+
+  async uploadCompanyData(res, req, file) {
+    try {
+      const loaded = await this.loadExcelRows(file);
+      if (loaded.error) {
+        return res.status(200).send({
+          status: HttpStatus.CONFLICT,
+          message: loaded.error,
+        });
+      }
+      const errors = [...(loaded.errors || [])];
+      let created = 0;
+      const userPhone = req.user?.phone || "EG-Backend";
+      const mobileRegex = /^(\+\d{1,3}[- ]?)?\d{10}$/;
+
+      for (const item of loaded.rows) {
+        const record = item.record;
+        const companyName =
+          this.excelCellText(record.company_name) ||
+          this.excelCellText(record.name) ||
+          this.excelCellText(record.site_name);
+        const branchName =
+          this.excelCellText(record.branch_name) ||
+          this.excelCellText(record.branch);
+        const adminName =
+          this.excelCellText(record.admin_name) ||
+          this.excelCellText(record.client_admin_name) ||
+          this.excelCellText(record.poc_name);
+        const adminPhone =
+          this.excelCellText(record.admin_phone) ||
+          this.excelCellText(record.phone) ||
+          this.excelCellText(record.client_admin_phone);
+        const adminEmail =
+          this.excelCellText(record.admin_email) ||
+          this.excelCellText(record.email) ||
+          this.excelCellText(record.client_admin_email);
+        const adminPassword =
+          this.excelCellText(record.admin_password) ||
+          this.excelCellText(record.password);
+        if (!companyName && !branchName && !adminName && !adminPhone) {
+          continue;
+        }
+        if (!companyName || !branchName) {
+          errors.push(`Row ${item.rowNumber}: company_name and branch_name are required`);
+          continue;
+        }
+        if (!adminName || !adminPhone || !adminEmail || !adminPassword) {
+          errors.push(
+            `Row ${item.rowNumber}: admin_name, admin_phone, admin_email and admin_password are required`
+          );
+          continue;
+        }
+        if (!mobileRegex.test(adminPhone)) {
+          errors.push(`Row ${item.rowNumber}: invalid admin_phone`);
+          continue;
+        }
+
+        const existingCompany = await prisma.company.findUnique({
+          where: {
+            company_name_branch_name: {
+              name: companyName,
+              branch_name: branchName,
+            },
+          },
+        });
+        if (existingCompany) {
+          errors.push(
+            `Row ${item.rowNumber}: company already exists (${companyName} / ${branchName})`
+          );
+          continue;
+        }
+
+        const existingUser = await prisma.user.findFirst({
+          where: {
+            OR: [
+              { phone: adminPhone },
+              { email: { equals: adminEmail, mode: "insensitive" } },
+            ],
+          },
+        });
+        if (existingUser) {
+          errors.push(
+            `Row ${item.rowNumber}: client admin already exists (${adminPhone} / ${adminEmail})`
+          );
+          continue;
+        }
+
+        const startDate =
+          this.excelDate(record.start_date) ||
+          moment.utc().startOf("day").toDate();
+        const endDate =
+          this.excelDate(record.end_date) ||
+          moment.utc().add(1, "year").startOf("day").toDate();
+
+        const dbUser = await prisma.user.create({
+          data: {
+            name: adminName,
+            location: this.excelCellText(record.admin_location) || "",
+            phone: adminPhone,
+            email: adminEmail,
+            password: adminPassword,
+            access_level: access_level.client_admin,
+            created_by: userPhone,
+            updated_by: userPhone,
+          },
+        });
+        const dbCompany = await prisma.company.create({
+          data: {
+            name: companyName,
+            branch_name: branchName,
+            email:
+              this.excelCellText(record.company_email) || adminEmail,
+            start_date: startDate,
+            end_date: endDate,
+            location:
+              this.excelCellText(record.company_location) ||
+              this.excelCellText(record.location) ||
+              "",
+            created_by: userPhone,
+            updated_by: userPhone,
+          },
+        });
+        await prisma.company_user.create({
+          data: {
+            company_link: dbCompany.id,
+            user_link: dbUser.id,
+          },
+        });
+        created += 1;
+      }
+
+      return res.status(200).send({
+        status: 200,
+        message: created
+          ? `Data uploaded successfully (${created} AMCs)`
+          : errors.length
+            ? "Upload finished with errors"
+            : "No AMC rows found in the Excel file",
+        errors,
+      });
+    } catch (e) {
+      return res.status(200).send({
+        status: HttpStatus.CONFLICT,
+        message: `Failed to upload AMC data ${e}`,
+      });
+    }
+  }
+
+  async uploadTechnicianData(res, req, file) {
+    try {
+      const loaded = await this.loadExcelRows(file);
+      if (loaded.error) {
+        return res.status(200).send({
+          status: HttpStatus.CONFLICT,
+          message: loaded.error,
+        });
+      }
+      const errors = [...(loaded.errors || [])];
+      let created = 0;
+      const userPhone = req.user?.phone || "EG-Backend";
+      const mobileRegex = /^(\+\d{1,3}[- ]?)?\d{10}$/;
+
+      for (const item of loaded.rows) {
+        const record = item.record;
+        const name = this.excelCellText(record.name);
+        const phone =
+          this.excelCellText(record.phone) ||
+          this.excelCellText(record.mobile);
+        const email = this.excelCellText(record.email);
+        const password = this.excelCellText(record.password);
+        if (!name && !phone && !email) continue;
+        if (!name || !phone || !email || !password) {
+          errors.push(
+            `Row ${item.rowNumber}: name, phone, email and password are required`
+          );
+          continue;
+        }
+        if (!mobileRegex.test(phone)) {
+          errors.push(`Row ${item.rowNumber}: invalid phone`);
+          continue;
+        }
+        const existingUser = await prisma.user.findFirst({
+          where: {
+            OR: [
+              { phone },
+              { email: { equals: email, mode: "insensitive" } },
+            ],
+          },
+        });
+        if (existingUser) {
+          errors.push(`Row ${item.rowNumber}: technician already exists (${phone} / ${email})`);
+          continue;
+        }
+        await prisma.user.create({
+          data: {
+            name,
+            phone,
+            email,
+            password,
+            location: this.excelCellText(record.location) || "",
+            access_level: access_level.technician,
+            created_by: userPhone,
+            updated_by: userPhone,
+          },
+        });
+        created += 1;
+      }
+
+      return res.status(200).send({
+        status: 200,
+        message: created
+          ? `Data uploaded successfully (${created} technicians)`
+          : errors.length
+            ? "Upload finished with errors"
+            : "No technician rows found in the Excel file",
+        errors,
+      });
+    } catch (e) {
+      return res.status(200).send({
+        status: HttpStatus.CONFLICT,
+        message: `Failed to upload technician data ${e}`,
       });
     }
   }

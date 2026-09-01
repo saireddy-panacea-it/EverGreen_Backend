@@ -193,8 +193,14 @@ export class UserService {
         data: user,
       });
       if (dbUser != null) {
-        const companyLinks = req.body.company_link;
-        // console.log(companyLinks);
+        const companyLinks = this.isTechnicianRole(dbUser.access_level)
+          ? []
+          : req.body.company_link;
+        if (this.isTechnicianRole(dbUser.access_level)) {
+          await prisma.company_user.deleteMany({
+            where: { user_link: dbUser.id },
+          });
+        }
         if (companyLinks?.length > 0) {
           const userId = dbUser.id; // Assuming `dbUser` contains the user information
 
@@ -1927,20 +1933,33 @@ export class UserService {
       // keep original
     }
     rel = rel.replace(/^\/+/, "");
-    const candidates = [rel, `./${rel}`, path.join(process.cwd(), rel)];
+    const candidates = [
+      rel,
+      `./${rel}`,
+      path.join(process.cwd(), rel),
+      path.join(__dirname, "..", "..", rel),
+      path.join(process.cwd(), "uploads", path.basename(rel)),
+    ];
     for (const candidate of candidates) {
-      if (candidate && existsSync(candidate)) return candidate;
+      if (candidate && existsSync(candidate)) {
+        return candidate;
+      }
     }
     return null;
   }
 
-  private async imageToDataUrl(imageUrl?: string) {
+  private imageMimeFromBuffer(buffer: Buffer): string {
+    if (buffer.length >= 8 && buffer[0] === 0x89 && buffer[1] === 0x50) {
+      return "image/png";
+    }
+    return "image/jpeg";
+  }
+
+  private async readImageBuffer(imageUrl?: string): Promise<Buffer | undefined> {
     if (!imageUrl) return undefined;
     const localPath = this.resolveLocalUploadPath(imageUrl);
     if (localPath) {
-      const buffer = readFileSync(localPath);
-      const mime = buffer[0] === 0x89 ? "image/png" : "image/jpeg";
-      return `data:${mime};base64,${buffer.toString("base64")}`;
+      return readFileSync(localPath);
     }
     try {
       const absolute = /^https?:\/\//i.test(imageUrl)
@@ -1949,48 +1968,180 @@ export class UserService {
       const response = await axios.get(absolute, {
         responseType: "arraybuffer",
         timeout: 8000,
+        validateStatus: (code) => code >= 200 && code < 400,
       });
-      return `data:image/jpeg;base64,${Buffer.from(response.data).toString("base64")}`;
-    } catch {
+      return Buffer.from(response.data);
+    } catch (error) {
+      this.logger.warn(`Unable to read image ${imageUrl}: ${error?.message || error}`);
       return undefined;
     }
   }
 
-  async buildLocalServiceReportView(taskLink, signUrl?: string) {
+  private async imageToDataUrl(imageUrl?: string) {
+    const buffer = await this.readImageBuffer(imageUrl);
+    if (!buffer) return undefined;
+    const mime = this.imageMimeFromBuffer(buffer);
+    return `data:${mime};base64,${buffer.toString("base64")}`;
+  }
+
+  private async persistSignatureFile(taskLink: number, signUrl: string) {
+    const buffer = await this.readImageBuffer(signUrl);
+    if (!buffer) return null;
+    this.ensureUploadPath("./uploads/reports");
+    const dest = `./uploads/reports/sign-${taskLink}.png`;
+    writeFileSync(dest, buffer);
+    return dest;
+  }
+
+  private async urlToBase64(imageUrl: string) {
+    return this.imageToDataUrl(imageUrl);
+  }
+
+  statusLabel(value?: string) {
+    switch (value) {
+      case "open":
+        return "Not Started";
+      case "in_progress":
+        return "In Progress";
+      case "hold":
+        return "Hold";
+      case "closed":
+        return "Closed";
+      default:
+        return value || "Open";
+    }
+  }
+
+  formatReportTime(value?: Date | string) {
+    if (!value) return "-";
+    return moment(value).format("DD MMM YYYY, hh:mm A");
+  }
+
+  yesNo(value) {
+    if (value === true) return "Yes";
+    if (value === false) return "No";
+    return "-";
+  }
+
+  async buildServiceReportView(taskLink, requester, signatureBase64?: string) {
     const task = await prisma.tasks.findUnique({
       where: { id: taskLink },
       include: {
         task_user: { orderBy: { created_at: "asc" } },
+        hold_reason: { orderBy: { created_at: "asc" } },
+        image: true,
         equipment: { include: { company: true } },
       },
     });
-    const latest = task?.task_user?.[task.task_user.length - 1];
-    const client = latest?.client_link
-      ? await prisma.user.findUnique({ where: { id: latest.client_link } })
-      : null;
+    if (!task) {
+      return { error: { status: 404, message: "Task not found" } };
+    }
+    if (!this.canAccessCompany(requester, task.equipment?.company_link)) {
+      return {
+        error: {
+          status: 403,
+          message: "You can only view reports for your attached company",
+        },
+      };
+    }
+
+    const userIds = new Set<number>();
+    for (const row of task.task_user) {
+      if (row.technician_link) userIds.add(row.technician_link);
+      if (row.client_link) userIds.add(row.client_link);
+    }
+    const users = userIds.size
+      ? await prisma.user.findMany({
+          where: { id: { in: [...userIds] } },
+          select: { id: true, name: true, phone: true, email: true },
+        })
+      : [];
+    const userById = Object.fromEntries(users.map((item) => [item.id, item]));
+    const latest = task.task_user[task.task_user.length - 1];
+    const client = latest?.client_link ? userById[latest.client_link] : null;
     const technician = latest?.technician_link
-      ? await prisma.user.findUnique({ where: { id: latest.technician_link } })
+      ? userById[latest.technician_link]
       : null;
-    const savedSign = `./uploads/reports/sign-${taskLink}.png`;
-    const signature = existsSync(savedSign)
-      ? await this.imageToDataUrl(savedSign)
-      : await this.imageToDataUrl(signUrl);
+    const currentStatus = latest?.status || "open";
+
+    const timeline: Array<{ time: string; title: string; detail: string }> = [
+      {
+        time: this.formatReportTime(task.created_at),
+        title: "Task created",
+        detail: `${task.name || "Task"} was raised${task.created_by ? ` by ${task.created_by}` : ""}.`,
+      },
+    ];
+
+    for (const row of task.task_user) {
+      const tech = row.technician_link ? userById[row.technician_link] : null;
+      const actor = row.updated_by || row.created_by || tech?.name || "System";
+      if (row.status === "open" && row.technician_link) {
+        timeline.push({
+          time: this.formatReportTime(row.updated_at || row.created_at),
+          title: "Technician assigned",
+          detail: `${tech?.name || "Technician"} accepted this task${actor ? ` (${actor})` : ""}.`,
+        });
+      } else if (row.status === "open") {
+        timeline.push({
+          time: this.formatReportTime(row.created_at),
+          title: "Awaiting technician",
+          detail: "Task is open and not assigned yet.",
+        });
+      } else if (row.status === "in_progress") {
+        timeline.push({
+          time: this.formatReportTime(row.updated_at || row.created_at),
+          title: "Work started",
+          detail: `${tech?.name || actor} moved the task to In Progress.`,
+        });
+      } else if (row.status === "hold") {
+        timeline.push({
+          time: this.formatReportTime(row.updated_at || row.created_at),
+          title: "Task put on hold",
+          detail: row.reason || `${actor} placed the task on hold.`,
+        });
+      } else if (row.status === "closed") {
+        timeline.push({
+          time: this.formatReportTime(row.updated_at || row.created_at),
+          title: "Task closed",
+          detail: `Service completed${tech?.name ? ` by ${tech.name}` : ""}.`,
+        });
+      }
+    }
+
+    for (const hold of task.hold_reason || []) {
+      timeline.push({
+        time: this.formatReportTime(hold.created_at),
+        title: "Hold reason recorded",
+        detail: [hold.hold, hold.spare_part_number, hold.reason]
+          .filter(Boolean)
+          .join(" · "),
+      });
+    }
+
+    timeline.sort((a, b) => {
+      const left = moment(a.time, "DD MMM YYYY, hh:mm A").valueOf();
+      const right = moment(b.time, "DD MMM YYYY, hh:mm A").valueOf();
+      return left - right;
+    });
+
+    const images = [];
+
     return {
-      ticket_no: task?.ticket_no,
-      generated_at: moment().format("DD MMM YYYY, hh:mm A"),
-      current_status: latest?.status === "closed" ? "Closed" : latest?.status || "Open",
-      status_key: latest?.status || "open",
-      is_closed: latest?.status === "closed",
-      created_at: task?.created_at,
-      created_by: task?.created_by,
-      call_type: task?.call_type,
-      task_name: task?.name,
-      task_description: task?.description,
+      ticket_no: task.ticket_no,
+      generated_at: this.formatReportTime(new Date()),
+      current_status: this.statusLabel(currentStatus),
+      status_key: currentStatus,
+      is_closed: currentStatus === "closed",
+      created_at: this.formatReportTime(task.created_at),
+      created_by: task.created_by,
+      call_type: task.call_type ? String(task.call_type).replace(/_/g, " ").toUpperCase() : "-",
+      task_name: task.name,
+      task_description: task.description,
       company: {
-        name: task?.equipment?.company?.name,
-        branch: task?.equipment?.company?.branch_name,
-        location: task?.equipment?.company?.location,
-        email: task?.equipment?.company?.email,
+        name: task.equipment?.company?.name,
+        branch: task.equipment?.company?.branch_name,
+        location: task.equipment?.company?.location,
+        email: task.equipment?.company?.email,
       },
       contact: {
         name: client?.name,
@@ -2003,63 +2154,49 @@ export class UserService {
         note: technician ? "Assigned technician" : "No technician assigned yet",
       },
       equipment: {
-        name: task?.equipment?.name,
-        make: task?.equipment?.make,
-        model: task?.equipment?.model,
-        serial_no: task?.equipment?.serial_number,
-        eg_serial: task?.equipment?.eg_serial_number,
-        location: task?.equipment?.location,
+        name: task.equipment?.name,
+        make: task.equipment?.make,
+        model: task.equipment?.model,
+        serial_no: task.equipment?.serial_number,
+        eg_serial: task.equipment?.eg_serial_number,
+        location: task.equipment?.location,
       },
-      timeline: [],
-      action_taken: task?.action_taken,
-      requirement: task?.req_details,
-      follow_up: task?.follow_up == null ? "-" : task.follow_up ? "Yes" : "No",
-      action_req_details: task?.action_req_details,
+      timeline,
+      action_taken: task.action_taken,
+      requirement: task.req_details,
+      follow_up: this.yesNo(task.follow_up),
+      action_req_details: task.action_req_details,
       customer: {
-        service_satisfactory:
-          task?.service_satisfactory == null
-            ? "-"
-            : task.service_satisfactory
-              ? "Yes"
-              : "No",
-        is_running_smoothly:
-          task?.is_running_smoothly == null
-            ? "-"
-            : task.is_running_smoothly
-              ? "Yes"
-              : "No",
-        notes: task?.feedback || task?.notes,
-        rating: task?.rating != null ? `${task.rating} / 5` : "-",
+        service_satisfactory: this.yesNo(task.service_satisfactory),
+        is_running_smoothly: this.yesNo(task.is_running_smoothly),
+        notes: task.feedback || task.notes,
+        rating: task.rating != null ? `${task.rating} / 5` : "-",
       },
-      images: [],
-      signature: signature || "",
+      images,
+      signature: signatureBase64 || "",
     };
   }
 
-  private async urlToBase64(imageUrl: string) {
-    if (!imageUrl) {
-      return undefined;
-    }
-
-    imageUrl = `${process.env.BASE_URL + imageUrl}`;
-
-    try {
-      const response = await axios.get(imageUrl, {
-        responseType: "arraybuffer",
-      });
-      const imageBuffer = Buffer.from(response.data, "binary");
-
-      // Convert the buffer to a base64 string
-      const base64Image = imageBuffer.toString("base64");
-      return `data:image/jpeg;base64,${base64Image}`;
-    } catch (error) {
-      console.error("Error converting image URL to base64:", error);
-      return undefined; // Or handle the error as appropriate for your use case
-    }
+  async writeServiceReportPdf(taskLink, view, includeBase64 = true) {
+    this.ensureUploadPath("./uploads/reports");
+    const filePath = `./uploads/reports/file-${taskLink}.pdf`;
+    const pdfBuffer = Buffer.from(await buildServiceReportPdf(view));
+    writeFileSync(filePath, pdfBuffer);
+    return {
+      url: `uploads/reports/file-${taskLink}.pdf`,
+      pdf_base64: includeBase64 ? pdfBuffer.toString("base64") : undefined,
+    };
   }
 
   async getServiceReport(res, req) {
     try {
+      const requester = await this.findOne(req.user.phone);
+      if (requester?.access_level === access_level.technician) {
+        return res.status(403).send({
+          status: 403,
+          message: "Technicians cannot generate a service report",
+        });
+      }
       const taskLink = await this.resolveTaskLink(req.body.task_link);
       if (!taskLink) {
         return res.status(400).send({
@@ -2067,18 +2204,27 @@ export class UserService {
           message: "task_link is required",
         });
       }
-      const view = await this.buildLocalServiceReportView(taskLink, req.body.sign_url);
-      if (!existsSync("./uploads/reports")) {
-        mkdirSync("./uploads/reports", { recursive: true });
+      let signature;
+      const savedSign = `./uploads/reports/sign-${taskLink}.png`;
+      if (existsSync(savedSign)) {
+        signature = await this.imageToDataUrl(savedSign);
+      } else if (req.body.sign_url) {
+        signature = await this.imageToDataUrl(req.body.sign_url);
       }
-      const pdfBuffer = Buffer.from(await buildServiceReportPdf(view));
-      const filePath = `./uploads/reports/file-${taskLink}.pdf`;
-      writeFileSync(filePath, pdfBuffer);
+      const view = await this.buildServiceReportView(
+        taskLink,
+        requester,
+        signature
+      );
+      if (view.error) {
+        return res.status(view.error.status).send(view.error);
+      }
+      const reportFile = await this.writeServiceReportPdf(taskLink, view, true);
       return res.status(200).send({
         status: 200,
         message: "Service report generated successfully",
-        url: `uploads/reports/file-${taskLink}.pdf`,
-        pdf_base64: pdfBuffer.toString("base64"),
+        url: reportFile.url,
+        pdf_base64: reportFile.pdf_base64,
       });
     } catch (error) {
       console.error("getServiceReport failed", error);
@@ -2406,18 +2552,29 @@ export class UserService {
   }
 
   async updateTaskFeedback(res, req) {
-    let response;
-    const task = await prisma.tasks.findUnique({
-      where: {
-        id: req.body.task_link,
-      },
-    });
+    try {
+      const taskLink = await this.resolveTaskLink(
+        req.body.task_link ?? req.body.task_user_link
+      );
+      if (!taskLink) {
+        return res.send({
+          message: "task_link is required",
+          status: 400,
+        });
+      }
+      const task = await prisma.tasks.findUnique({
+        where: { id: taskLink },
+      });
 
-    if (task) {
+      if (!task) {
+        return res.send({
+          message: `task not found in db with id: ${taskLink}`,
+          status: 204,
+        });
+      }
+
       const updateTask = await prisma.tasks.update({
-        where: {
-          id: req.body.task_link,
-        },
+        where: { id: taskLink },
         data: {
           call_type: req.body.call_type
             ? mapCallTypeToEnum(req.body.call_type)
@@ -2438,76 +2595,69 @@ export class UserService {
         },
       });
 
-      if (updateTask) {
-        response = {
-          message: `task updated successfully`,
-          data: updateTask,
-          status: 200,
-        };
-        try {
-          const actor = await this.findOne(req.user?.phone);
-          const latestAssignment = await prisma.task_user.findFirst({
-            where: { task_link: req.body.task_link },
-            orderBy: { id: "desc" },
+      try {
+        const actor = await this.findOne(req.user?.phone);
+        const latestAssignment = await prisma.task_user.findFirst({
+          where: { task_link: taskLink },
+          orderBy: { id: "desc" },
+        });
+        const equipment = await prisma.equipment.findUnique({
+          where: { id: task.equipment_link },
+          include: { company: true },
+        });
+        const hasNotes = Boolean(
+          req.body.action_taken ||
+            req.body.req_details ||
+            req.body.action_req_details ||
+            req.body.notes,
+        );
+        const hasFeedback = Boolean(
+          req.body.feedback ||
+            req.body.rating != null ||
+            req.body.service_satisfactory != null ||
+            req.body.is_running_smoothly != null,
+        );
+        if (hasNotes) {
+          await this.notificationService.onTaskNotesUpdated({
+            task: updateTask,
+            equipment,
+            companyLink: equipment?.company_link,
+            updatedByName: actor?.name ?? actor?.phone,
+            actorUserId: actor?.id,
+            notes:
+              req.body.action_taken ||
+              req.body.notes ||
+              req.body.req_details,
           });
-          const equipment = await prisma.equipment.findUnique({
-            where: { id: task.equipment_link },
-            include: { company: true },
-          });
-          const hasNotes = Boolean(
-            req.body.action_taken ||
-              req.body.req_details ||
-              req.body.action_req_details ||
-              req.body.notes,
-          );
-          const hasFeedback = Boolean(
-            req.body.feedback ||
-              req.body.rating != null ||
-              req.body.service_satisfactory != null ||
-              req.body.is_running_smoothly != null,
-          );
-          if (hasNotes) {
-            await this.notificationService.onTaskNotesUpdated({
-              task: updateTask,
-              equipment,
-              companyLink: equipment?.company_link,
-              updatedByName: actor?.name ?? actor?.phone,
-              actorUserId: actor?.id,
-              notes:
-                req.body.action_taken ||
-                req.body.notes ||
-                req.body.req_details,
-            });
-          }
-          if (hasFeedback) {
-            await this.notificationService.onFeedback({
-              task: updateTask,
-              equipment,
-              companyLink: equipment?.company_link,
-              technicianUserId: latestAssignment?.technician_link,
-              actorUserId: actor?.id,
-              submittedByName: actor?.name ?? actor?.phone,
-              feedback: req.body.feedback,
-              rating: req.body.rating,
-            });
-          }
-        } catch (notifyError) {
-          console.error("updateTaskFeedback notification failed", notifyError);
         }
-      } else {
-        response = {
-          message: `task not updated successfully`,
-          status: 204,
-        };
+        if (hasFeedback) {
+          await this.notificationService.onFeedback({
+            task: updateTask,
+            equipment,
+            companyLink: equipment?.company_link,
+            technicianUserId: latestAssignment?.technician_link,
+            actorUserId: actor?.id,
+            submittedByName: actor?.name ?? actor?.phone,
+            feedback: req.body.feedback,
+            rating: this.coerceRating(req.body.rating),
+          });
+        }
+      } catch (notifyError) {
+        console.error("updateTaskFeedback notification failed", notifyError);
       }
-    } else {
-      response = {
-        message: `task not found in db with id: ${req.body.task_link}`,
-        status: 204,
-      };
-    }
 
-    return res.send(response);
+      return res.send({
+        message: "task updated successfully",
+        data: updateTask,
+        status: 200,
+      });
+    } catch (error) {
+      this.logger.error("updateTaskFeedback failed", error);
+      return res.send({
+        message: "Unable to save task feedback",
+        status: 500,
+      });
+    }
   }
 
   async tasksCount(res, req) {
@@ -3127,6 +3277,71 @@ export class UserService {
     if (!existsSync(path)) {
       mkdirSync(path, { recursive: true });
     }
+  }
+
+  private cloudinaryEnabled() {
+    return String(process.env.CLOUDINARY_DISABLED || "").toLowerCase() !== "true";
+  }
+
+  async uploadToCloudinary(file: Express.Multer.File, folderName?: string) {
+    if (!this.cloudinaryEnabled() || !file?.buffer) {
+      return null;
+    }
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME || "dcci94lc";
+    const preset = process.env.CLOUDINARY_UPLOAD_PRESET || "evergreen_app";
+    const folder = `evergreen/${String(folderName || "misc")
+      .replace(/[^a-zA-Z0-9/_-]/g, "_")
+      .replace(/^\/+|\/+$/g, "")}`;
+    const form = new FormData();
+    const blob = new Blob([file.buffer], {
+      type: file.mimetype || "application/octet-stream",
+    });
+    const original = String(file.originalname || "upload.bin").replace(
+      /[^a-zA-Z0-9._-]/g,
+      "_"
+    );
+    form.append("file", blob, original);
+    form.append("upload_preset", preset);
+    form.append("folder", folder);
+    form.append("tags", folderName || "evergreen");
+    const { data } = await axios.post(
+      `https://api.cloudinary.com/v1_1/${cloudName}/image/upload`,
+      form,
+      { timeout: 30000 }
+    );
+    return data?.secure_url || data?.url || null;
+  }
+
+  async uploadMedia(res, req, file: Express.Multer.File) {
+    if (!file) {
+      return res.status(402).send({
+        status: 402,
+        message: "Something went wrong",
+      });
+    }
+    const folderName = (req.query?.folderName as string) || "misc";
+    try {
+      const cloudUrl = await this.uploadToCloudinary(file, folderName);
+      if (cloudUrl) {
+        return res.status(200).send({
+          status: 200,
+          message: "File uploaded Successfully",
+          image_url: cloudUrl,
+        });
+      }
+    } catch (error) {
+      this.logger.error("Cloudinary upload failed, using local disk", error);
+    }
+
+    const uploadPath = path.join(process.cwd(), "uploads", folderName);
+    this.ensureUploadPath(uploadPath);
+    const fileName = `${Date.now()}-${String(file.originalname || "upload.bin").replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+    writeFileSync(path.join(uploadPath, fileName), file.buffer);
+    return res.status(200).send({
+      status: 200,
+      message: "File uploaded Successfully",
+      image_url: path.join("uploads", folderName, fileName),
+    });
   }
 
   async sendNotification(

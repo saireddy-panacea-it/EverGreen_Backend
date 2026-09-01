@@ -12,7 +12,7 @@ import {
 import { UserService } from "./user.service";
 import { Response, Request } from "express";
 import { FileInterceptor } from "@nestjs/platform-express";
-import { diskStorage } from "multer";
+import { diskStorage, memoryStorage } from "multer";
 import * as path from "path";
 import * as fs from "fs";
 import { extname, join } from "path";
@@ -201,52 +201,15 @@ export class UserController {
   @Post("upload-file")
   @UseInterceptors(
     FileInterceptor("file", {
-      storage: diskStorage({
-        destination: (req, file, callback) => {
-          const folderName = (req.query?.folderName as string) || undefined;
-          const uploadPath = path.join(
-            __dirname,
-            "..",
-            "..",
-            "uploads",
-            folderName ?? ""
-          );
-          console.log(folderName, "folderName");
-          // Create the folder if it doesn't exist
-          fs.mkdirSync(uploadPath, { recursive: true });
-
-          callback(null, uploadPath);
-        },
-        filename: (req, file, callback) => {
-          const timeStamp = new Date().valueOf();
-          const fileName = `${timeStamp}-${file.originalname}`;
-          callback(null, fileName);
-        },
-      }),
+      storage: memoryStorage(),
     })
   )
-  uploadFile(
+  async uploadFile(
     @UploadedFile() file: Express.Multer.File,
     @Res() res: Response,
     @Req() req: Request
   ) {
-    const baseUrl = process.env.BASE_URL;
-    const folderName = (req.query?.folderName as string) || undefined;
-    const relativeImagePath = path.join("uploads", folderName, file.filename);
-    const imageUrl = `${relativeImagePath}`;
-
-    if (file) {
-      return res.status(200).send({
-        status: 200,
-        message: "File uploaded Successfully",
-        image_url: imageUrl,
-      });
-    } else {
-      return res.status(402).send({
-        status: 402,
-        message: "Something went wrong",
-      });
-    }
+    return await this.userService.uploadMedia(res, req, file);
   }
 
   @Get("get-image/:imageName")

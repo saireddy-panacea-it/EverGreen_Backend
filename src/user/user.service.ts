@@ -282,9 +282,9 @@ export class UserService {
         location: req.body.company_location,
         logo: req.body.logo,
         created_at: undefined,
-        created_by: req.body.phone,
+        created_by: userPhone,
         updated_at: undefined,
-        updated_by: req.body.phone,
+        updated_by: userPhone,
         address_link: null,
       };
 
@@ -369,22 +369,6 @@ export class UserService {
       }
 
       const userInfo = await this.findOne(req.user.phone);
-      const isAdmin = this.adminOrNot(userInfo?.access_level);
-      if (!isAdmin) {
-        const isLinked = await prisma.company_user.findFirst({
-          where: {
-            company_link: companyId,
-            user_link: req.user.sub,
-          },
-        });
-        if (!isLinked) {
-          return res.send({
-            message: "You do not have access to update this company",
-            status: HttpStatus.FORBIDDEN,
-          });
-        }
-      }
-
       const existingCompany = await prisma.company.findUnique({
         where: { id: companyId },
       });
@@ -393,6 +377,23 @@ export class UserService {
           message: "company not found",
           status: HttpStatus.NOT_FOUND,
         });
+      }
+
+      const isAdmin = this.adminOrNot(userInfo?.access_level);
+      if (!isAdmin) {
+        const isLinked = await prisma.company_user.findFirst({
+          where: {
+            company_link: companyId,
+            user_link: req.user.sub,
+          },
+        });
+        const isCreator = existingCompany.created_by === req.user.phone;
+        if (!isLinked && !isCreator) {
+          return res.send({
+            message: "You do not have access to update this company",
+            status: HttpStatus.FORBIDDEN,
+          });
+        }
       }
 
       const companyName = String(
@@ -496,22 +497,6 @@ export class UserService {
       }
 
       const userInfo = await this.findOne(req.user.phone);
-      const isAdmin = this.adminOrNot(userInfo?.access_level);
-      if (!isAdmin) {
-        const isLinked = await prisma.company_user.findFirst({
-          where: {
-            company_link: companyId,
-            user_link: req.user.sub,
-          },
-        });
-        if (!isLinked) {
-          return res.send({
-            message: "You do not have access to delete this company",
-            status: HttpStatus.FORBIDDEN,
-          });
-        }
-      }
-
       const existingCompany = await prisma.company.findUnique({
         where: { id: companyId },
       });
@@ -520,6 +505,23 @@ export class UserService {
           message: "company not found",
           status: HttpStatus.NOT_FOUND,
         });
+      }
+
+      const isAdmin = this.adminOrNot(userInfo?.access_level);
+      if (!isAdmin) {
+        const isLinked = await prisma.company_user.findFirst({
+          where: {
+            company_link: companyId,
+            user_link: req.user.sub,
+          },
+        });
+        const isCreator = existingCompany.created_by === req.user.phone;
+        if (!isLinked && !isCreator) {
+          return res.send({
+            message: "You do not have access to delete this company",
+            status: HttpStatus.FORBIDDEN,
+          });
+        }
       }
 
       const companyEquipments = await prisma.equipment.findMany({

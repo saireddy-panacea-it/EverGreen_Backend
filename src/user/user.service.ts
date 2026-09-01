@@ -221,6 +221,13 @@ export class UserService {
         return this.deleteCompany(res, req);
       }
 
+      const companyLink = parseInt(String(req.body.company_link ?? ""), 10);
+      const companyName = String(req.body.company_name ?? "").trim();
+      const branchName = String(req.body.branch_name ?? "").trim();
+      if (!isNaN(companyLink) && !companyName && !branchName) {
+        return this.deleteCompany(res, req);
+      }
+
       const userPhone = req.user.phone;
       const mobile = String(req.body.phone ?? "").trim();
 

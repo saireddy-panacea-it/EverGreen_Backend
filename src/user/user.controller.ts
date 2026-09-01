@@ -40,6 +40,20 @@ export class UserController {
     return await this.userService.createCompany(res, req);
   }
 
+  @Put("updateCompany/:id")
+  async updateCompany(
+    @Param("id") id: string,
+    @Res() res: Response,
+    @Req() req: Request
+  ) {
+    return await this.userService.updateCompany(id, res, req);
+  }
+
+  @Post("deleteCompany")
+  async deleteCompany(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.deleteCompany(res, req);
+  }
+
   @Get("getAllCompanies")
   async getAllCompanies(@Res() res: Response, @Req() req: Request) {
     return await this.userService.getAllCompanies(res, req);

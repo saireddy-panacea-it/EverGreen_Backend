@@ -218,16 +218,32 @@ export class UserService {
   async createCompany(res, req) {
     try {
       const userPhone = req.user.phone;
+      const mobile = String(req.body.phone ?? "").trim();
+
+      if (!mobile) {
+        return res.send({
+          message: "PLEASE ENTER MOBILE NUMBER",
+          status: HttpStatus.BAD_REQUEST,
+        });
+      }
+
+      const mobileRegex = /^(\+\d{1,3}[- ]?)?\d{10}$/;
+      if (!mobileRegex.test(mobile)) {
+        return res.send({
+          message: "Please enter valid mobile number",
+          status: HttpStatus.BAD_REQUEST,
+        });
+      }
 
       // Prepare user object
       const userData: user = {
         id: undefined,
-        name: req.body.name,
+        name: String(req.body.name ?? "").trim(),
         location: req.body.location,
-        phone: req.body.phone,
-        email: req.body.email,
+        phone: mobile,
+        email: String(req.body.email ?? "").trim(),
         notes: req.body.notes,
-        password: req.body.password,
+        password: String(req.body.password ?? "").trim(),
         access_level: access_level.client_admin,
         pan_id: "",
         aadhaar_id: "",
@@ -255,8 +271,14 @@ export class UserService {
         name: req.body.company_name,
         branch_name: req.body.branch_name,
         email: req.body.company_email,
-        start_date: moment(req.body.start_date, "yyyy-MM-dd").toDate(),
-        end_date: moment(req.body.end_date, "yyyy-MM-dd").toDate(),
+        start_date: moment
+          .utc(req.body.start_date, "YYYY-MM-DD", true)
+          .startOf("day")
+          .toDate(),
+        end_date: moment
+          .utc(req.body.end_date, "YYYY-MM-DD", true)
+          .startOf("day")
+          .toDate(),
         location: req.body.company_location,
         logo: req.body.logo,
         created_at: undefined,
@@ -282,6 +304,20 @@ export class UserService {
         });
       }
 
+      if (!moment.utc(req.body.start_date, "YYYY-MM-DD", true).isValid()) {
+        return res.send({
+          message: "Invalid start date",
+          status: HttpStatus.BAD_REQUEST,
+        });
+      }
+
+      if (!moment.utc(req.body.end_date, "YYYY-MM-DD", true).isValid()) {
+        return res.send({
+          message: "Invalid end date",
+          status: HttpStatus.BAD_REQUEST,
+        });
+      }
+
       // Create user and company in parallel
       const [dbUser, dbCompany] = await Promise.all([
         prisma.user.create({ data: userData }),
@@ -297,7 +333,9 @@ export class UserService {
       });
 
       try {
-        await this.notificationService.sendCredentialsEmail(dbUser);
+        if (dbUser.email.trim().length > 0 && dbUser.password.trim().length > 0) {
+          await this.notificationService.sendCredentialsEmail(dbUser);
+        }
         await this.notificationService.onNewAmc({
           companyName: dbCompany.name,
           managerName: dbUser.name,
@@ -311,6 +349,232 @@ export class UserService {
         message: `company created successfully`,
         status: 200,
         data: dbCompany,
+      });
+    } catch (error) {
+      return res.send({
+        message: `something went wrong ${error}`,
+        status: 204,
+      });
+    }
+  }
+
+  async updateCompany(id, res, req) {
+    try {
+      const companyId = parseInt(id, 10);
+      if (isNaN(companyId)) {
+        return res.send({
+          message: "Invalid company id",
+          status: HttpStatus.BAD_REQUEST,
+        });
+      }
+
+      const userInfo = await this.findOne(req.user.phone);
+      const isAdmin = this.adminOrNot(userInfo?.access_level);
+      if (!isAdmin) {
+        const isLinked = await prisma.company_user.findFirst({
+          where: {
+            company_link: companyId,
+            user_link: req.user.sub,
+          },
+        });
+        if (!isLinked) {
+          return res.send({
+            message: "You do not have access to update this company",
+            status: HttpStatus.FORBIDDEN,
+          });
+        }
+      }
+
+      const existingCompany = await prisma.company.findUnique({
+        where: { id: companyId },
+      });
+      if (!existingCompany) {
+        return res.send({
+          message: "company not found",
+          status: HttpStatus.NOT_FOUND,
+        });
+      }
+
+      const companyName = String(
+        req.body.company_name ?? existingCompany.name ?? ""
+      ).trim();
+      const branchName = String(
+        req.body.branch_name ?? existingCompany.branch_name ?? ""
+      ).trim();
+      const startDateRaw = String(req.body.start_date ?? "").trim();
+      const endDateRaw = String(req.body.end_date ?? "").trim();
+
+      if (companyName.length === 0) {
+        return res.send({
+          message: "Please enter site name",
+          status: HttpStatus.BAD_REQUEST,
+        });
+      }
+      if (branchName.length === 0) {
+        return res.send({
+          message: "Please enter branch name",
+          status: HttpStatus.BAD_REQUEST,
+        });
+      }
+
+      let parsedStartDate = existingCompany.start_date;
+      let parsedEndDate = existingCompany.end_date;
+
+      if (startDateRaw.length > 0) {
+        const startMoment = moment.utc(startDateRaw, "YYYY-MM-DD", true);
+        if (!startMoment.isValid()) {
+          return res.send({
+            message: "Invalid start date",
+            status: HttpStatus.BAD_REQUEST,
+          });
+        }
+        parsedStartDate = startMoment.startOf("day").toDate();
+      }
+
+      if (endDateRaw.length > 0) {
+        const endMoment = moment.utc(endDateRaw, "YYYY-MM-DD", true);
+        if (!endMoment.isValid()) {
+          return res.send({
+            message: "Invalid end date",
+            status: HttpStatus.BAD_REQUEST,
+          });
+        }
+        parsedEndDate = endMoment.startOf("day").toDate();
+      }
+
+      const duplicateCompany = await prisma.company.findFirst({
+        where: {
+          name: companyName,
+          branch_name: branchName,
+          NOT: { id: companyId },
+        },
+      });
+      if (duplicateCompany) {
+        return res.send({
+          message: `company already exists with name ${companyName} and branch ${branchName}`,
+          status: HttpStatus.CONFLICT,
+        });
+      }
+
+      const updatedCompany = await prisma.company.update({
+        where: { id: companyId },
+        data: {
+          name: companyName,
+          branch_name: branchName,
+          email: String(req.body.company_email ?? existingCompany.email ?? ""),
+          location: String(
+            req.body.company_location ?? existingCompany.location ?? ""
+          ),
+          logo: String(req.body.logo ?? existingCompany.logo ?? ""),
+          start_date: parsedStartDate ?? undefined,
+          end_date: parsedEndDate ?? undefined,
+          updated_by: req.user.phone,
+        },
+      });
+
+      return res.status(200).send({
+        status: 200,
+        message: "company updated successfully",
+        data: updatedCompany,
+      });
+    } catch (error) {
+      return res.send({
+        message: `something went wrong ${error}`,
+        status: 204,
+      });
+    }
+  }
+
+  async deleteCompany(res, req) {
+    try {
+      const companyId = parseInt(String(req.body.company_link ?? ""), 10);
+      if (isNaN(companyId)) {
+        return res.send({
+          message: "Invalid company id",
+          status: HttpStatus.BAD_REQUEST,
+        });
+      }
+
+      const userInfo = await this.findOne(req.user.phone);
+      const isAdmin = this.adminOrNot(userInfo?.access_level);
+      if (!isAdmin) {
+        const isLinked = await prisma.company_user.findFirst({
+          where: {
+            company_link: companyId,
+            user_link: req.user.sub,
+          },
+        });
+        if (!isLinked) {
+          return res.send({
+            message: "You do not have access to delete this company",
+            status: HttpStatus.FORBIDDEN,
+          });
+        }
+      }
+
+      const existingCompany = await prisma.company.findUnique({
+        where: { id: companyId },
+      });
+      if (!existingCompany) {
+        return res.send({
+          message: "company not found",
+          status: HttpStatus.NOT_FOUND,
+        });
+      }
+
+      const companyEquipments = await prisma.equipment.findMany({
+        where: { company_link: companyId },
+        select: { id: true },
+      });
+      const equipmentIds = companyEquipments.map((x) => x.id);
+
+      const linkedTasks = equipmentIds.length
+        ? await prisma.tasks.findMany({
+            where: {
+              equipment_link: { in: equipmentIds },
+            },
+            select: { id: true },
+          })
+        : [];
+      const taskIds = linkedTasks.map((x) => x.id);
+
+      await prisma.$transaction(async (tx) => {
+        if (taskIds.length > 0) {
+          await tx.images.deleteMany({
+            where: { taskId: { in: taskIds } },
+          });
+          await tx.hold_reason.deleteMany({
+            where: { task_link: { in: taskIds } },
+          });
+          await tx.task_user.deleteMany({
+            where: { task_link: { in: taskIds } },
+          });
+          await tx.notifications.deleteMany({
+            where: { task_link: { in: taskIds } },
+          });
+          await tx.tasks.deleteMany({
+            where: { id: { in: taskIds } },
+          });
+        }
+
+        if (equipmentIds.length > 0) {
+          await tx.equipment.deleteMany({
+            where: { id: { in: equipmentIds } },
+          });
+        }
+
+        await tx.company_user.deleteMany({
+          where: { company_link: companyId },
+        });
+
+        await tx.company.delete({
+          where: { id: companyId },
+        });
+      });
+
+      return res.status(200).send({
+        status: 200,
+        message: "company deleted successfully",
       });
     } catch (error) {
       return res.send({

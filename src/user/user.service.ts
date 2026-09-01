@@ -2873,6 +2873,7 @@ export class UserService {
         });
       }
       const errors = [];
+      const duplicates = [];
       let created = 0;
 
       for (const worksheet of workBook.worksheets || []) {
@@ -2953,8 +2954,8 @@ export class UserService {
             },
           });
           if (existing) {
-            errors.push(
-              `Row ${rowNumber}: equipment already exists (${name} / ${make} / ${model})`
+            duplicates.push(
+              `Row ${rowNumber}: ${name} / ${make} / ${model}`
             );
             continue;
           }
@@ -2965,12 +2966,10 @@ export class UserService {
 
       return res.status(200).send({
         status: 200,
-        message: created
-          ? `Data uploaded successfully (${created} equipment)`
-          : errors.length
-            ? "Upload finished with errors"
-            : "No equipment rows found in the Excel file",
-        errors,
+        message: this.uploadSummary(created, duplicates, errors, "equipment"),
+        errors: [...duplicates.map((item) => `Duplicate skipped: ${item}`), ...errors],
+        added: created,
+        skipped: duplicates.length,
       });
     } catch (e) {
       return res.status(200).send({
@@ -3026,6 +3025,7 @@ export class UserService {
         });
       }
       const errors = [...(loaded.errors || [])];
+      const duplicates = [];
       let created = 0;
       const userPhone = req.user?.phone || "EG-Backend";
       const mobileRegex = /^(\+\d{1,3}[- ]?)?\d{10}$/;
@@ -3081,8 +3081,8 @@ export class UserService {
           },
         });
         if (existingCompany) {
-          errors.push(
-            `Row ${item.rowNumber}: company already exists (${companyName} / ${branchName})`
+          duplicates.push(
+            `Row ${item.rowNumber}: ${companyName} / ${branchName}`
           );
           continue;
         }
@@ -3096,8 +3096,8 @@ export class UserService {
           },
         });
         if (existingUser) {
-          errors.push(
-            `Row ${item.rowNumber}: client admin already exists (${adminPhone} / ${adminEmail})`
+          duplicates.push(
+            `Row ${item.rowNumber}: ${adminPhone} / ${adminEmail}`
           );
           continue;
         }
@@ -3148,12 +3148,10 @@ export class UserService {
 
       return res.status(200).send({
         status: 200,
-        message: created
-          ? `Data uploaded successfully (${created} AMCs)`
-          : errors.length
-            ? "Upload finished with errors"
-            : "No AMC rows found in the Excel file",
-        errors,
+        message: this.uploadSummary(created, duplicates, errors, "AMCs"),
+        errors: [...duplicates.map((item) => `Duplicate skipped: ${item}`), ...errors],
+        added: created,
+        skipped: duplicates.length,
       });
     } catch (e) {
       return res.status(200).send({
@@ -3173,6 +3171,7 @@ export class UserService {
         });
       }
       const errors = [...(loaded.errors || [])];
+      const duplicates = [];
       let created = 0;
       const userPhone = req.user?.phone || "EG-Backend";
       const mobileRegex = /^(\+\d{1,3}[- ]?)?\d{10}$/;
@@ -3205,7 +3204,7 @@ export class UserService {
           },
         });
         if (existingUser) {
-          errors.push(`Row ${item.rowNumber}: technician already exists (${phone} / ${email})`);
+          duplicates.push(`Row ${item.rowNumber}: ${name} (${phone} / ${email})`);
           continue;
         }
         await prisma.user.create({
@@ -3225,12 +3224,10 @@ export class UserService {
 
       return res.status(200).send({
         status: 200,
-        message: created
-          ? `Data uploaded successfully (${created} technicians)`
-          : errors.length
-            ? "Upload finished with errors"
-            : "No technician rows found in the Excel file",
-        errors,
+        message: this.uploadSummary(created, duplicates, errors, "technicians"),
+        errors: [...duplicates.map((item) => `Duplicate skipped: ${item}`), ...errors],
+        added: created,
+        skipped: duplicates.length,
       });
     } catch (e) {
       return res.status(200).send({
@@ -3238,6 +3235,25 @@ export class UserService {
         message: `Failed to upload technician data ${e}`,
       });
     }
+  }
+
+  private uploadSummary(
+    created: number,
+    duplicates: string[],
+    errors: string[],
+    label: string
+  ): string {
+    const parts = [`Added ${created} ${label}`];
+    if (duplicates.length) {
+      parts.push(`not added ${duplicates.length} duplicates`);
+    }
+    if (errors.length) {
+      parts.push(`${errors.length} rows had errors`);
+    }
+    if (!created && !duplicates.length && !errors.length) {
+      return `No ${label} rows found in the Excel file`;
+    }
+    return parts.join(". ");
   }
 
   getValueAs<T>(row: any, key: string): T | undefined {

@@ -217,6 +217,10 @@ export class UserService {
   }
   async createCompany(res, req) {
     try {
+      if (String(req.body.action ?? "").trim().toLowerCase() === "delete") {
+        return this.deleteCompany(res, req);
+      }
+
       const userPhone = req.user.phone;
       const mobile = String(req.body.phone ?? "").trim();
 

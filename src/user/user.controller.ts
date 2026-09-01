@@ -69,6 +69,26 @@ export class UserController {
     return await this.userService.updateEquipment(res, req);
   }
 
+  @Post("deleteEquipment")
+  async deleteEquipment(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.deleteEquipment(res, req);
+  }
+
+  @Post("updateTask")
+  async updateTask(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.updateTask(res, req);
+  }
+
+  @Post("deleteTask")
+  async deleteTask(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.deleteTask(res, req);
+  }
+
+  @Post("deleteUser")
+  async deleteUser(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.deleteUser(res, req);
+  }
+
   @Post("createTask")
   async createTask(@Res() res: Response, @Req() req: Request) {
     return await this.userService.createTask(res, req);
@@ -140,6 +160,11 @@ export class UserController {
   @Post("getNotificationsByUserId")
   async getNotificationsByUserId(@Res() res: Response, @Req() req: Request) {
     return await this.userService.getNotificationsByUserId(res, req);
+  }
+
+  @Post("upsertToken")
+  async upsertToken(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.registerFcm(res, req);
   }
 
   @Post("updateHoldReasons")

@@ -78,10 +78,24 @@ export class FirebaseService {
       payloadData.title = String(title);
     }
 
+    const body = payloadData.description || payloadData.title || title;
+    const channelId = payloadData.channel_id || 'evergreen_normal';
+
     if (this.initialized) {
       return admin.messaging().send({
         token,
         data: payloadData,
+        notification: {
+          title: String(title || payloadData.title || 'Evergreen'),
+          body: String(body),
+        },
+        android: {
+          priority: 'high',
+          notification: {
+            channelId,
+            sound: 'default',
+          },
+        },
       });
     }
 

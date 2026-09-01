@@ -40,6 +40,7 @@ model company {
   end_date            DateTime?
   location            String?
   logo                String?   @db.VarChar(300)
+  is_active           Boolean   @default(true)
   parent_company_link Int?
   address_link        Int?      
   created_at          DateTime  @default(now())
@@ -154,6 +155,7 @@ model equipment {
   created_by        String?
   updated_at        DateTime      @default(now())
   updated_by        String?
+  is_active         Boolean       @default(true)
 
   @@unique([eg_serial_number, make, model], name: "equipment_eg_serial_number_make_model")
 }

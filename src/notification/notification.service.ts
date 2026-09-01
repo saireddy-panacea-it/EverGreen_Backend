@@ -113,16 +113,6 @@ export class NotificationService {
 
     for (const userId of ids) {
       try {
-        const tokens = await prisma.tokens.findMany({
-          where: { user_link: userId },
-          select: { fcm_id: true },
-        });
-        const fcmIds = tokens.map((row) => row.fcm_id).filter(Boolean);
-        await Promise.all(
-          fcmIds.map((token) =>
-            this.firebaseService.sendNotification(token, title, payload),
-          ),
-        );
         await prisma.notifications.create({
           data: {
             title,
@@ -139,7 +129,24 @@ export class NotificationService {
         });
       } catch (error) {
         this.logger.error(
-          `Failed to notify user ${userId}: ${error?.message || error}`,
+          `Failed to persist notification for user ${userId}: ${error?.message || error}`,
+        );
+      }
+
+      try {
+        const tokens = await prisma.tokens.findMany({
+          where: { user_link: userId },
+          select: { fcm_id: true },
+        });
+        const fcmIds = tokens.map((row) => row.fcm_id).filter(Boolean);
+        await Promise.all(
+          fcmIds.map((token) =>
+            this.firebaseService.sendNotification(token, title, payload),
+          ),
+        );
+      } catch (error) {
+        this.logger.error(
+          `Failed to push to user ${userId}: ${error?.message || error}`,
         );
       }
     }

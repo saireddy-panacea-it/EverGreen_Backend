@@ -19,8 +19,8 @@ import {
 } from "src/common";
 
 import { existsSync, mkdirSync } from "fs";
-// import ExcelJS from 'exceljs';
-import ExcelJS from "exceljs";
+// exceljs is CommonJS; default import is undefined at runtime (Workbook crash)
+const ExcelJS = require("exceljs");
 import * as moment from "moment";
 var QRCode = require("qrcode");
 import { PDFDocument, rgb } from "pdf-lib";
@@ -69,6 +69,23 @@ export class UserService {
         message: `user already exists with phone ${existingUser.phone}`,
         status: 204,
       });
+    }
+
+    if (user.email && String(user.email).trim() !== "") {
+      const existingEmail = await prisma.user.findFirst({
+        where: {
+          email: {
+            equals: String(user.email).trim(),
+            mode: "insensitive",
+          },
+        },
+      });
+      if (existingEmail) {
+        return res.send({
+          message: `This email is already used by another user`,
+          status: 204,
+        });
+      }
     }
 
     const dbUser = await prisma.user.create({
@@ -136,11 +153,28 @@ export class UserService {
       },
     });
     if (existingUser) {
+      if (req.body.email && String(req.body.email).trim() !== "") {
+        const emailTaken = await prisma.user.findFirst({
+          where: {
+            email: { equals: String(req.body.email).trim(), mode: "insensitive" },
+            NOT: { id: parseInt(id) },
+          },
+        });
+        if (emailTaken) {
+          return res.send({
+            status: 204,
+            message: "This email is already used by another user",
+          });
+        }
+      }
       const user = {
+        name: req.body.name ?? existingUser?.name,
+        location: req.body.location ?? existingUser?.location,
+        access_level: req.body.access_level ?? existingUser?.access_level,
         email: req.body.email ?? existingUser?.email,
         phone: req.body.phone ?? existingUser?.phone,
         updated_by: req.body.phone ?? existingUser?.phone,
-        password: req.body.password ?? existingUser?.password,
+        password: req.body.password || existingUser?.password,
       };
       const dbUser = await prisma.user.update({
         where: {
@@ -274,6 +308,23 @@ export class UserService {
           message: `user already exists with phone ${existingUser.phone}`,
           status: HttpStatus.NO_CONTENT,
         });
+      }
+
+      if (userData.email && String(userData.email).trim() !== "") {
+        const existingEmail = await prisma.user.findFirst({
+          where: {
+            email: {
+              equals: String(userData.email).trim(),
+              mode: "insensitive",
+            },
+          },
+        });
+        if (existingEmail) {
+          return res.send({
+            message: `This email is already used by another user`,
+            status: HttpStatus.NO_CONTENT,
+          });
+        }
       }
 
       // Prepare company object
@@ -770,12 +821,14 @@ export class UserService {
       },
     });
     let equipments;
+    const includeCompany = { company: true };
     if (equipment_link || companyLink) {
       equipments = await prisma.equipment.findMany({
         where: {
           id: equipment_link ?? undefined,
           company_link: companyLink ?? undefined,
         },
+        include: includeCompany,
       });
     } else {
       equipments = await prisma.equipment.findMany({
@@ -784,6 +837,7 @@ export class UserService {
             in: getCompanyLinks.map((x) => x.company_link),
           },
         },
+        include: includeCompany,
       });
     }
 
@@ -854,6 +908,7 @@ export class UserService {
           updated_at: undefined,
           updated_by: "",
           manual: "",
+          is_active: true,
         };
 
         console.log(equipment);
@@ -909,17 +964,25 @@ export class UserService {
       const updatedEquipment = await prisma.equipment.update({
         where: { id: equipmentId },
         data: {
-          image_url: req.body.image_url,
-          specifications: req.body.specifications,
+          name: req.body.name ?? dbEquipment.name,
+          make: req.body.make ?? dbEquipment.make,
+          model: req.body.model ?? dbEquipment.model,
+          serial_number:
+            req.body.serial_number ??
+            req.body.specifications ??
+            dbEquipment.serial_number,
+          image_url: req.body.image_url ?? dbEquipment.image_url,
+          specifications:
+            req.body.specifications ?? dbEquipment.specifications,
           manufacturer_date: req.body.manufacturer_date
             ? new Date(req.body.manufacturer_date)
-            : undefined,
-          location: req.body.location,
-          description: req.body.description,
-          tm_frequency: req.body.tm_frequency,
+            : dbEquipment.manufacturer_date,
+          location: req.body.location ?? dbEquipment.location,
+          description: req.body.description ?? dbEquipment.description,
+          tm_frequency: req.body.tm_frequency ?? dbEquipment.tm_frequency,
           updated_at: new Date(),
           updated_by: req.user.phone || "",
-          manual: req.body.manual || "",
+          manual: req.body.manual || dbEquipment.manual || "",
         },
       });
 
@@ -939,6 +1002,127 @@ export class UserService {
       return res.status(500).send({
         status: 500,
         message: "Internal server error",
+        error: error.message,
+      });
+    }
+  }
+
+  async deleteEquipment(res, req) {
+    try {
+      const equipmentId = parseInt(req.body.equipment_link, 10);
+      const activate = String(req.body.action || "").toLowerCase() === "activate";
+      const dbEquipment = await prisma.equipment.findUnique({
+        where: { id: equipmentId },
+      });
+      if (!dbEquipment) {
+        return res.send({
+          status: 204,
+          message: "Equipment not found",
+        });
+      }
+      await prisma.equipment.update({
+        where: { id: equipmentId },
+        data: {
+          is_active: activate,
+          updated_at: new Date(),
+          updated_by: req.user?.phone || "",
+        },
+      });
+      return res.status(200).send({
+        status: 200,
+        message: activate
+          ? "Equipment marked active"
+          : "Equipment marked inactive",
+      });
+    } catch (error) {
+      return res.status(500).send({
+        status: 500,
+        message: "Internal server error",
+        error: error.message,
+      });
+    }
+  }
+
+  async updateTask(res, req) {
+    try {
+      const taskId = parseInt(req.body.task_link, 10);
+      const dbTask = await prisma.tasks.findUnique({ where: { id: taskId } });
+      if (!dbTask) {
+        return res.send({ status: 204, message: "Task not found" });
+      }
+      const updated = await prisma.tasks.update({
+        where: { id: taskId },
+        data: {
+          name: req.body.name ?? dbTask.name,
+          description: req.body.description ?? dbTask.description,
+          call_type: req.body.call_type ?? dbTask.call_type,
+          equipment_link: req.body.equipment_link ?? dbTask.equipment_link,
+          updated_at: new Date(),
+          updated_by: req.user?.phone || "",
+        },
+      });
+      return res.status(200).send({
+        status: 200,
+        data: updated,
+        message: "Task updated successfully",
+      });
+    } catch (error) {
+      return res.status(500).send({
+        status: 500,
+        message: "Internal server error",
+        error: error.message,
+      });
+    }
+  }
+
+  async deleteTask(res, req) {
+    try {
+      const taskId = parseInt(req.body.task_link, 10);
+      const dbTask = await prisma.tasks.findUnique({ where: { id: taskId } });
+      if (!dbTask) {
+        return res.send({ status: 204, message: "Task not found" });
+      }
+      await prisma.hold_reason.deleteMany({ where: { task_link: taskId } });
+      await prisma.images.deleteMany({ where: { taskId } });
+      await prisma.task_user.deleteMany({ where: { task_link: taskId } });
+      await prisma.tasks.delete({ where: { id: taskId } });
+      return res.status(200).send({
+        status: 200,
+        message: "Task deleted successfully",
+      });
+    } catch (error) {
+      return res.status(500).send({
+        status: 500,
+        message: "Unable to delete this task",
+        error: error.message,
+      });
+    }
+  }
+
+  async deleteUser(res, req) {
+    try {
+      const userId = parseInt(req.body.user_link, 10);
+      if (req.user?.sub && parseInt(req.user.sub, 10) === userId) {
+        return res.send({
+          status: 204,
+          message: "You cannot delete your own account",
+        });
+      }
+      const dbUser = await prisma.user.findUnique({ where: { id: userId } });
+      if (!dbUser) {
+        return res.send({ status: 204, message: "User not found" });
+      }
+      await prisma.company_user.deleteMany({ where: { user_link: userId } });
+      await prisma.tokens.deleteMany({ where: { user_link: userId } }).catch(() => {});
+      await prisma.user.delete({ where: { id: userId } });
+      return res.status(200).send({
+        status: 200,
+        message: "User deleted successfully",
+      });
+    } catch (error) {
+      return res.status(500).send({
+        status: 500,
+        message: "Unable to delete this user because they are linked to tasks",
         error: error.message,
       });
     }
@@ -969,6 +1153,29 @@ export class UserService {
         updated_by: userPhone,
         updated_at: new Date(),
       },
+    });
+  }
+
+  async registerFcm(res, req) {
+    const fcmId = String(req.body.fcm_id ?? "").trim();
+    const deviceId = String(req.body.device_id ?? "").trim();
+    const user = await this.findOne(req.user.phone);
+    if (!user) {
+      return res.status(401).send({
+        status: 401,
+        message: "Please login again",
+      });
+    }
+    if (!fcmId || !deviceId) {
+      return res.status(400).send({
+        status: 400,
+        message: "fcm_id and device_id are required",
+      });
+    }
+    await this.upsertTokens(fcmId, deviceId, user.id, user.phone);
+    return res.status(200).send({
+      status: 200,
+      message: "token registered",
     });
   }
 
@@ -1849,6 +2056,11 @@ export class UserService {
       taskStatus != null
         ? tasksWithImages.filter((x) => x.status == taskStatus)
         : tasksWithImages;
+    filteredTasksByStatus.sort((a, b) => {
+      const left = new Date(a.task?.created_at || a.created_at || 0).getTime();
+      const right = new Date(b.task?.created_at || b.created_at || 0).getTime();
+      return right - left;
+    });
 
     for (let i = 0; i < filteredTasksByStatus.length; i++) {
       if (filteredTasksByStatus[i].client_link != null) {
@@ -2208,11 +2420,56 @@ export class UserService {
     });
   }
 
+  private excelCellText(value: any): string | undefined {
+    if (value == null || value === "") return undefined;
+    if (value instanceof Date) return value.toISOString();
+    if (typeof value === "number") return String(value);
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      return trimmed || undefined;
+    }
+    if (typeof value === "object") {
+      if (value.text) return this.excelCellText(value.text);
+      if (value.result != null) return this.excelCellText(value.result);
+      if (Array.isArray(value.richText)) {
+        return this.excelCellText(value.richText.map((part) => part.text).join(""));
+      }
+    }
+    const asString = String(value).trim();
+    return asString || undefined;
+  }
+
+  private excelHeaderKey(value: any): string | undefined {
+    const text = this.excelCellText(value);
+    if (!text) return undefined;
+    return text.toLowerCase().replace(/\s+/g, "_");
+  }
+
+  private excelDate(value: any): Date | undefined {
+    if (value instanceof Date && !isNaN(value.getTime())) return value;
+    const text = this.excelCellText(value);
+    if (!text) return undefined;
+    const parsed = new Date(text);
+    return isNaN(parsed.getTime()) ? undefined : parsed;
+  }
+
   async uploadEquipmentData(res, req, file) {
     try {
-      const workBook = new ExcelJS.Workbook();
+      if (!file?.buffer) {
+        return res.status(200).send({
+          status: HttpStatus.CONFLICT,
+          message: "No Excel file received",
+        });
+      }
+      const WorkbookCtor = ExcelJS?.Workbook || ExcelJS?.default?.Workbook;
+      if (!WorkbookCtor) {
+        return res.status(200).send({
+          status: HttpStatus.CONFLICT,
+          message: "Excel parser is not available on server",
+        });
+      }
+      const workBook = new WorkbookCtor();
       await workBook.xlsx.load(file.buffer);
-      const sheetList = workBook.worksheets;
       const dbCompany = await prisma.company.findUnique({
         where: {
           id: parseInt(req.body?.company_link),
@@ -2226,118 +2483,104 @@ export class UserService {
         });
       }
       const errors = [];
+      let created = 0;
 
-      for (const sheet of sheetList) {
-        const worksheet = workBook.getWorksheet(sheet.name);
-        const columnCount = worksheet.columnCount;
-        const columns = [];
-        for (let i = 0; i < columnCount; i++) {
-          const header = worksheet.columns[i]?.values[1];
-          if (header) {
-            const column = {
-              header: header,
-              key: header,
-            };
-            columns.push(column);
-          }
+      for (const worksheet of workBook.worksheets || []) {
+        const headerMap = new Map<number, string>();
+        worksheet.getRow(1).eachCell((cell, colNumber) => {
+          const key = this.excelHeaderKey(cell.value);
+          if (key) headerMap.set(colNumber, key);
+        });
+        if (headerMap.size === 0) {
+          errors.push(`Sheet ${worksheet.name}: missing header row`);
+          continue;
         }
 
-        worksheet.columns = columns;
-        const rows = worksheet.getColumn(1);
-        const rowsCount = rows["_worksheet"]["_rows"].length;
-        for (let i = 2; i <= rowsCount; i++) {
-          const row = worksheet.getRow(i);
-          if (row.getCell(2).value != null) {
-            const eg_serial_number = getAccountFromCompany(
-              req.body.name +
-                req.body.make +
-                req.body.model +
-                parseInt(req.body?.company_link) +
-                req.body.specifications +
-                req.body.location,
-              "EG-"
-            );
-            // const images = worksheet.getRow(i).getCell(11).value;
-
-            // usc_no: this.getValueAs<string>(row, 'usc_no'),
-            const equipmentData: equipment = {
-              id: undefined,
-              name: this.getValueAs<string>(row, "name"),
-              make: this.getValueAs<string>(row, "make"),
-              model: this.getValueAs<string>(row, "model"),
-              serial_number: this.getValueAs<string>(row, "serial_number"),
-              eg_serial_number:
-                this.getValueAs<string>(row, "eg_serial_number") ??
-                eg_serial_number,
-              specifications: this.getValueAs<string>(row, "specifications"),
-              manufacturer_date: this.getValueAs<Date>(
-                row,
-                "manufacturer_date"
-              ),
-              image_url: null,
-              location: this.getValueAs<string>(row, "location"),
-              description: this.getValueAs<string>(row, "description"),
-              tm_frequency: this.getValueAs<string>(
-                row,
-                "tm_frequency"
-              ) as tm_frequency,
-              company_link: dbCompany.id,
-              created_at: undefined,
-              created_by: "EG-Backend",
-              updated_at: undefined,
-              updated_by: "EG-Backend",
-              manual: "",
-            };
-
-            equipmentData.serial_number = getAccountFromCompany(
-              equipmentData.name +
-                equipmentData.make +
-                equipmentData.model +
-                dbCompany.id,
-              "EG-"
-            );
-            if (equipmentData.name && equipmentData.serial_number) {
-              const dbEquipment = await prisma.equipment.findFirst({
-                where: {
-                  serial_number: equipmentData.serial_number,
-                  make: equipmentData.make,
-                  model: equipmentData.model,
-                },
-              });
-
-              if (!dbEquipment) {
-                const dbEquipment = await prisma.equipment.findFirst({
-                  where: {
-                    serial_number: equipmentData.serial_number,
-                  },
-                });
-                if (!dbEquipment) {
-                  await prisma.equipment.upsert({
-                    where: {
-                      equipment_eg_serial_number_make_model: {
-                        eg_serial_number: equipmentData.eg_serial_number,
-                        make: equipmentData.make,
-                        model: equipmentData.model,
-                      },
-                    },
-                    create: equipmentData,
-                    update: equipmentData,
-                  });
-                } else {
-                  errors.push(
-                    `serial number must be unique: ${equipmentData.serial_number}, make: ${equipmentData.make}, model: ${equipmentData.model}`
-                  );
-                }
-              }
-            }
+        const lastRow = Math.max(worksheet.rowCount || 0, worksheet.actualRowCount || 0);
+        for (let rowNumber = 2; rowNumber <= lastRow; rowNumber++) {
+          const row = worksheet.getRow(rowNumber);
+          const record: Record<string, any> = {};
+          row.eachCell((cell, colNumber) => {
+            const key = headerMap.get(colNumber);
+            if (key) record[key] = cell.value;
+          });
+          const name = this.excelCellText(record.name);
+          const make = this.excelCellText(record.make);
+          const model = this.excelCellText(record.model);
+          if (!name && !make && !model) continue;
+          if (!name || !make || !model) {
+            const missing = [
+              !name ? "name" : null,
+              !make ? "make" : null,
+              !model ? "model" : null,
+            ].filter(Boolean);
+            errors.push(`Row ${rowNumber}: missing ${missing.join(", ")}`);
+            continue;
           }
+
+          const serial_number = getAccountFromCompany(
+            name + make + model + dbCompany.id,
+            "EG-"
+          );
+          const eg_serial_number =
+            this.excelCellText(record.eg_serial_number) ||
+            getAccountFromCompany(
+              name +
+                make +
+                model +
+                dbCompany.id +
+                (this.excelCellText(record.specifications) || "") +
+                (this.excelCellText(record.location) || ""),
+              "EG-"
+            );
+          const frequency = this.excelCellText(record.tm_frequency) as tm_frequency;
+          const equipmentData: any = {
+            name,
+            make,
+            model,
+            serial_number,
+            eg_serial_number,
+            specifications: this.excelCellText(record.specifications) || "",
+            manufacturer_date: this.excelDate(record.manufacturer_date) ?? undefined,
+            image_url: null,
+            location: this.excelCellText(record.location) || "",
+            description: this.excelCellText(record.description) || "",
+            tm_frequency: frequency || undefined,
+            company_link: dbCompany.id,
+            created_by: "EG-Backend",
+            updated_by: "EG-Backend",
+            manual: "",
+            is_active: true,
+          };
+
+          const existing = await prisma.equipment.findFirst({
+            where: {
+              OR: [
+                { serial_number, make, model },
+                { serial_number },
+                { eg_serial_number, make, model },
+              ],
+            },
+          });
+          if (existing) {
+            errors.push(
+              `Row ${rowNumber}: equipment already exists (${name} / ${make} / ${model})`
+            );
+            continue;
+          }
+          await prisma.equipment.create({ data: equipmentData });
+          created += 1;
         }
       }
 
       return res.status(200).send({
         status: 200,
-        message: "Data uploaded succesfully",
-        errors: errors,
+        message: created
+          ? `Data uploaded successfully (${created} equipment)`
+          : errors.length
+            ? "Upload finished with errors"
+            : "No equipment rows found in the Excel file",
+        errors,
       });
     } catch (e) {
       return res.status(200).send({
@@ -2389,39 +2632,43 @@ export class UserService {
   async sendNotification(
     tokens: string[],
     title: string,
-    data: any
+    data: any,
+    explicitUserIds?: number[]
   ): Promise<void> {
-    try {
-      const promises = tokens.map((token) =>
-        this.firebaseService.sendNotification(token, title, data)
-      );
-      await Promise.all(promises);
+    const userIds = (
+      explicitUserIds?.length
+        ? explicitUserIds
+        : await this.getUserIdsByTokens(tokens)
+    ).filter((id) => id != null);
+    const taskLink =
+      data?.task_link != null ? parseInt(String(data.task_link), 10) : null;
+    const description = String(data?.description || title || "Notification");
 
-      const userIds = await this.getUserIdsByTokens(tokens);
-
-      for (const userId of userIds) {
-        const notification = {
-          id: undefined,
-          title,
-          description: data?.description,
-          image_url: data?.image_url,
-          task_link: parseInt(data?.task_link),
-          user_link: userId,
-          is_read: false,
-          created_at: undefined,
-          created_by: "EG-Backend",
-          updated_at: undefined,
-          updated_by: "EG-Backend",
-        };
-
+    for (const userId of userIds) {
+      try {
         await prisma.notifications.create({
-          data: notification,
+          data: {
+            title,
+            description,
+            image_url: data?.image_url || "",
+            task_link: Number.isNaN(taskLink) ? null : taskLink,
+            user_link: userId,
+            is_read: false,
+            created_by: "EG-Backend",
+            updated_by: "EG-Backend",
+          },
         });
+      } catch (error) {
+        console.error("Failed to persist in-app notification", error);
       }
+    }
 
-      console.log("Notifications sent successfully");
-    } catch (error) {
-      console.error("Error sending notification:", error);
+    for (const token of (tokens || []).filter(Boolean)) {
+      try {
+        await this.firebaseService.sendNotification(token, title, data);
+      } catch (error) {
+        console.error("Failed to send push notification", error);
+      }
     }
   }
 

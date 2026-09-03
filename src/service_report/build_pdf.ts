@@ -71,9 +71,9 @@ export async function buildServiceReportPdf(view: any): Promise<Uint8Array> {
 
   page.drawRectangle({
     x: MARGIN,
-    y: y - 78,
+    y: y - 90,
     width: contentWidth,
-    height: 78,
+    height: 90,
     color: NAVY,
   });
   text("EVERGREEN ENTERPRISES", MARGIN + 12, y - 10, 14, bold, WHITE);
@@ -93,20 +93,33 @@ export async function buildServiceReportPdf(view: any): Promise<Uint8Array> {
     color: BLUE,
   });
   text("SERVICE REPORT", PAGE_WIDTH - MARGIN - 90, y - 14, 7, bold, WHITE);
-  text("Ticket", MARGIN + 12, y - 48, 8, regular, rgb(0.75, 0.8, 0.86));
-  text(view.ticket_no || "-", MARGIN + 12, y - 60, 11, bold, WHITE);
-  text("Generated", MARGIN + 180, y - 48, 8, regular, rgb(0.75, 0.8, 0.86));
-  text(view.generated_at || "-", MARGIN + 180, y - 60, 10, bold, WHITE);
-  text("Status", MARGIN + 360, y - 48, 8, regular, rgb(0.75, 0.8, 0.86));
+  text("Service Report", MARGIN + 12, y - 48, 8, regular, rgb(0.75, 0.8, 0.86));
+  text(
+    view.service_report_number || view.ticket_no || "-",
+    MARGIN + 12,
+    y - 60,
+    11,
+    bold,
+    WHITE,
+  );
+  text("Ticket", MARGIN + 180, y - 48, 8, regular, rgb(0.75, 0.8, 0.86));
+  text(view.ticket_no || "-", MARGIN + 180, y - 60, 10, bold, WHITE);
+  text("Generated", MARGIN + 330, y - 48, 8, regular, rgb(0.75, 0.8, 0.86));
+  text(view.generated_at || "-", MARGIN + 330, y - 60, 9, bold, WHITE);
+  text("Status", MARGIN + 12, y - 72, 8, regular, rgb(0.75, 0.8, 0.86));
+  const closed =
+    view.status_key === "closed" ||
+    view.status_key === "completed" ||
+    view.is_closed;
   page.drawRectangle({
-    x: MARGIN + 360,
-    y: y - 74,
+    x: MARGIN + 52,
+    y: y - 86,
     width: 90,
     height: 12,
-    color: view.status_key === "closed" ? rgb(0.3, 0.71, 0.16) : ORANGE,
+    color: closed ? rgb(0.3, 0.71, 0.16) : ORANGE,
   });
-  text(view.current_status || "-", MARGIN + 364, y - 63, 8, bold, WHITE);
-  y -= 92;
+  text(view.current_status || "-", MARGIN + 56, y - 75, 8, bold, WHITE);
+  y -= 104;
 
   const cards = [
     {
@@ -124,7 +137,7 @@ export async function buildServiceReportPdf(view: any): Promise<Uint8Array> {
         view.contact?.name || "-",
         view.contact?.phone || "-",
         view.contact?.email || "",
-        view.created_by ? `Created by ${view.created_by}` : "",
+        view.contact?.note || (view.created_by ? `Created by ${view.created_by}` : ""),
       ],
     },
     {
@@ -243,14 +256,24 @@ export async function buildServiceReportPdf(view: any): Promise<Uint8Array> {
     y -= 6;
   });
 
-  if (view.action_taken || view.requirement) {
-    section("SERVICE NOTES");
+  if (view.service_details || view.action_taken || view.requirement) {
+    section("SERVICE / WORK DETAILS");
+    const details = wrap(
+      String(view.service_details || view.action_taken || "-"),
+      contentWidth - 8,
+      9,
+    );
+    details.forEach((line) => {
+      ensure(13);
+      text(line, MARGIN + 2, y, 9, regular, NAVY);
+      y -= 12;
+    });
+    y -= 6;
     const notes = [
-      ["Action taken", view.action_taken],
       ["Requirement", view.requirement],
       ["Follow up", view.follow_up],
       ["Details", view.action_req_details],
-    ];
+    ].filter(([, value]) => value);
     notes.forEach(([label, value]) => {
       const lines = wrap(String(value || "-"), contentWidth - 110, 9);
       ensure(14 + lines.length * 11);
@@ -266,53 +289,48 @@ export async function buildServiceReportPdf(view: any): Promise<Uint8Array> {
     y -= 6;
   }
 
-  const hasCustomer =
-    view.is_closed ||
-    view.customer?.service_satisfactory ||
-    view.customer?.is_running_smoothly ||
-    view.customer?.notes ||
-    view.customer?.rating ||
-    view.signature;
-  if (hasCustomer) {
-    section("CUSTOMER CONFIRMATION");
-    text(`Serviced to satisfaction: ${view.customer?.service_satisfactory || "-"}`, MARGIN + 2, y, 9);
-    y -= 13;
-    text(`Running smoothly: ${view.customer?.is_running_smoothly || "-"}`, MARGIN + 2, y, 9);
-    y -= 13;
-    wrap(`Comments: ${view.customer?.notes || "-"}`, contentWidth - 8, 9).forEach((line) => {
-      ensure(13);
-      text(line, MARGIN + 2, y, 9);
-      y -= 12;
-    });
-    text(`Rating: ${view.customer?.rating || "-"}`, MARGIN + 2, y, 9);
-    y -= 16;
-    if (view.signature) {
-      try {
-        const raw = String(view.signature).includes(",")
-          ? String(view.signature).split(",")[1]
-          : String(view.signature);
-        const bytes = Buffer.from(raw, "base64");
-        const image = view.signature.includes("image/png")
-          ? await doc.embedPng(bytes)
-          : await doc.embedJpg(bytes);
-        ensure(70);
-        text("Client signature", MARGIN + 2, y, 8, bold, MUTED);
-        y -= 8;
-        const sigWidth = 160;
-        const sigHeight = 48;
-        page.drawImage(image, {
-          x: MARGIN + 2,
-          y: y - sigHeight,
-          width: sigWidth,
-          height: sigHeight,
-        });
-        y -= sigHeight + 10;
-      } catch {
-        text("Client signature attached", MARGIN + 2, y, 8, regular, MUTED);
-        y -= 14;
-      }
+  section("CUSTOMER CONFIRMATION");
+  text(`Serviced to satisfaction: ${view.customer?.service_satisfactory || "-"}`, MARGIN + 2, y, 9);
+  y -= 13;
+  text(`Running smoothly: ${view.customer?.is_running_smoothly || "-"}`, MARGIN + 2, y, 9);
+  y -= 13;
+  wrap(`Comments: ${view.customer?.notes || "-"}`, contentWidth - 8, 9).forEach((line) => {
+    ensure(13);
+    text(line, MARGIN + 2, y, 9);
+    y -= 12;
+  });
+  text(`Rating: ${view.customer?.rating || "-"}`, MARGIN + 2, y, 9);
+  y -= 16;
+  if (view.signature) {
+    try {
+      const raw = String(view.signature).includes(",")
+        ? String(view.signature).split(",")[1]
+        : String(view.signature);
+      const bytes = Buffer.from(raw, "base64");
+      const image = String(view.signature).includes("image/png")
+        ? await doc.embedPng(bytes)
+        : await doc.embedJpg(bytes);
+      ensure(70);
+      text("Client signature", MARGIN + 2, y, 8, bold, MUTED);
+      y -= 8;
+      const sigWidth = 160;
+      const sigHeight = 48;
+      page.drawImage(image, {
+        x: MARGIN + 2,
+        y: y - sigHeight,
+        width: sigWidth,
+        height: sigHeight,
+      });
+      y -= sigHeight + 10;
+    } catch {
+      text("Client signature attached", MARGIN + 2, y, 8, regular, MUTED);
+      y -= 14;
     }
   }
+
+  section("SERVICE COST");
+  text(view.cost || "-", MARGIN + 2, y, 12, bold, NAVY);
+  y -= 18;
 
   ensure(28);
   page.drawLine({

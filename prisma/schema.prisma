@@ -53,6 +53,7 @@ model company {
   address      address?       @relation(fields: [address_link], references: [id])
   equipment    equipment[]
   company_user company_user[]
+  service_reports service_report[]
 
   @@unique([name, branch_name], name: "company_name_branch_name")
 }
@@ -261,4 +262,45 @@ model notifications {
   created_by String?
   updated_at DateTime @default(now())
   updated_by String?
+}
+
+model service_report {
+  id                              Int       @id @default(autoincrement())
+  service_report_number           String    @unique
+  task_id                         String?   @db.VarChar(100)
+  company_link                    Int?
+  company_name                    String    @db.VarChar(200)
+  company_branch                  String?   @db.VarChar(100)
+  location                        String?   @db.VarChar(300)
+  company_email                   String?   @db.VarChar(100)
+  raised_by_name                  String?   @db.VarChar(200)
+  raised_by_phone                 String?   @db.VarChar(50)
+  raised_by_email                 String?   @db.VarChar(100)
+  raised_by_note                  String?   @db.VarChar(300)
+  technician_name                 String?   @db.VarChar(200)
+  technician_phone                String?   @db.VarChar(50)
+  technician_note                 String?   @db.VarChar(300)
+  equipment_name                  String?   @db.VarChar(200)
+  equipment_make                  String?   @db.VarChar(200)
+  equipment_model                 String?   @db.VarChar(200)
+  equipment_serial_number         String?   @db.VarChar(200)
+  equipment_eg_serial_number      String?   @db.VarChar(200)
+  equipment_location              String?   @db.VarChar(300)
+  call_type                       String?   @db.VarChar(100)
+  issue                           String?   @db.VarChar(500)
+  issue_description               String?
+  service_details                 String?
+  timeline_events                 Json?
+  customer_serviced_to_satisfaction String? @db.VarChar(50)
+  equipment_running_smoothly      String?   @db.VarChar(50)
+  customer_comments               String?
+  rating                          String?   @db.VarChar(50)
+  cost                            Decimal?  @db.Decimal(12, 2)
+  status                          String    @default("Not Started") @db.VarChar(50)
+  generated_at                    DateTime?
+  created_at                      DateTime  @default(now())
+  created_by                      String?
+  updated_at                      DateTime  @default(now())
+  updated_by                      String?
+  company                         company?  @relation(fields: [company_link], references: [id])
 }

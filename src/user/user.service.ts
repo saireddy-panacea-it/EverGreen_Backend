@@ -2207,10 +2207,10 @@ export class UserService {
   async getServiceReport(res, req) {
     try {
       const requester = await this.findOne(req.user.phone);
-      if (requester?.access_level === access_level.technician) {
+      if (!this.adminOrNot(requester?.access_level)) {
         return res.status(403).send({
           status: 403,
-          message: "Technicians cannot generate a service report",
+          message: "You are not authorized to generate a service report",
         });
       }
       const taskLink = await this.resolveTaskLink(req.body.task_link);

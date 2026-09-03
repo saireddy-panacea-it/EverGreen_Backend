@@ -17,10 +17,14 @@ import * as path from "path";
 import * as fs from "fs";
 import { extname, join } from "path";
 import { apiKeyAuth } from "src/auth/api_key_auth.decorator";
+import { ServiceReportService } from "src/service_report/service_report.service";
 
 @Controller("user")
 export class UserController {
-  constructor(private userService: UserService) {}
+  constructor(
+    private userService: UserService,
+    private serviceReportService: ServiceReportService,
+  ) {}
   @Post("createUser")
   async createUser(@Res() res: Response, @Req() req: Request) {
     return await this.userService.createUser(res, req);
@@ -155,6 +159,41 @@ export class UserController {
   @Post("clientSignatureForReport")
   async clientSignatureForReport(@Res() res: Response, @Req() req: Request) {
     return await this.userService.clientSignatureForReport(res, req);
+  }
+
+  @Post("createServiceReport")
+  async createServiceReport(@Res() res: Response, @Req() req: Request) {
+    return await this.serviceReportService.createServiceReport(res, req);
+  }
+
+  @Post("updateServiceReport")
+  async updateServiceReport(@Res() res: Response, @Req() req: Request) {
+    return await this.serviceReportService.updateServiceReport(res, req);
+  }
+
+  @Post("deleteServiceReport")
+  async deleteServiceReport(@Res() res: Response, @Req() req: Request) {
+    return await this.serviceReportService.deleteServiceReport(res, req);
+  }
+
+  @Post("getAllServiceReports")
+  async getAllServiceReports(@Res() res: Response, @Req() req: Request) {
+    return await this.serviceReportService.getAllServiceReports(res, req);
+  }
+
+  @Post("getServiceReportDetails")
+  async getServiceReportDetails(@Res() res: Response, @Req() req: Request) {
+    return await this.serviceReportService.getServiceReportDetails(res, req);
+  }
+
+  @Post("downloadServiceReportPdf")
+  async downloadServiceReportPdf(@Res() res: Response, @Req() req: Request) {
+    return await this.serviceReportService.downloadServiceReportPdf(res, req);
+  }
+
+  @Post("getServiceReportPrefill")
+  async getServiceReportPrefill(@Res() res: Response, @Req() req: Request) {
+    return await this.serviceReportService.getServiceReportPrefill(res, req);
   }
 
   @Post("getNotificationsByUserId")

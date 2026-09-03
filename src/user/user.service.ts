@@ -1706,15 +1706,31 @@ export class UserService {
   }
 
   async getEquipmentInfo(res, req) {
-    const equipment_link = req.body.equipment_link;
-    const equipment = await prisma.equipment.findUnique({
-      where: {
-        id: equipment_link,
-      },
-      include: {
-        company: true,
-      },
-    });
+    const rawLink = req.body.equipment_link;
+    const asNumber = Number(rawLink);
+    let equipment = Number.isFinite(asNumber) && asNumber > 0
+      ? await prisma.equipment.findUnique({
+          where: { id: asNumber },
+          include: { company: true },
+        })
+      : null;
+    if (!equipment && rawLink != null && String(rawLink).trim() !== "") {
+      equipment = await prisma.equipment.findFirst({
+        where: {
+          OR: [
+            { eg_serial_number: String(rawLink).trim() },
+            { serial_number: String(rawLink).trim() },
+          ],
+        },
+        include: { company: true },
+      });
+    }
+    if (!equipment) {
+      return res.send({
+        success: 404,
+        message: `Data not found for equipment: ${rawLink}`,
+      });
+    }
 
     const tasks = await prisma.task_user.findMany({
       where: {
@@ -3493,6 +3509,54 @@ export class UserService {
       },
     });
 
+    await this.enrichNotificationsWithAcceptedBy(notifications);
+
+    return res.status(200).send({
+      status: 200,
+      message: "Notifications retrieved successfully",
+      data: notifications,
+    });
+  }
+
+  async getNotificationsPage(res, req) {
+    const userId = req.body.user_link ?? req.user.sub;
+    const rawPage = Number(req.body.page);
+    const rawLimit = Number(req.body.limit);
+    const page =
+      Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1;
+    const limit =
+      Number.isFinite(rawLimit) && rawLimit >= 1
+        ? Math.min(50, Math.floor(rawLimit))
+        : 20;
+    const skip = (page - 1) * limit;
+
+    const where = { user_link: userId };
+    const [total, notifications] = await Promise.all([
+      prisma.notifications.count({ where }),
+      prisma.notifications.findMany({
+        where,
+        orderBy: {
+          created_at: "desc",
+        },
+        skip,
+        take: limit,
+      }),
+    ]);
+
+    await this.enrichNotificationsWithAcceptedBy(notifications);
+
+    return res.status(200).send({
+      status: 200,
+      message: "Notifications retrieved successfully",
+      data: notifications,
+      page,
+      limit,
+      total,
+      has_more: skip + notifications.length < total,
+    });
+  }
+
+  private async enrichNotificationsWithAcceptedBy(notifications) {
     for (const notification of notifications) {
       const tasks = await prisma.tasks.findFirst({
         where: {
@@ -3508,9 +3572,8 @@ export class UserService {
         },
       });
 
-      const filteredTaskUser = tasks?.task_user.filter(
-        (user) => user.technician_link !== null
-      );
+      const filteredTaskUser =
+        tasks?.task_user.filter((user) => user.technician_link !== null) ?? [];
 
       const oldestTechnicianLink = filteredTaskUser.length
         ? filteredTaskUser.reduce((oldest, user) => {
@@ -3535,12 +3598,6 @@ export class UserService {
 
       notification["accepted_by"] = technicianUser ?? null;
     }
-
-    return res.status(200).send({
-      status: 200,
-      message: "Notifications retrieved successfully",
-      data: notifications,
-    });
   }
 
   getFileUrl(filePath: string): string {

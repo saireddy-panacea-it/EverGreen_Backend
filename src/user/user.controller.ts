@@ -162,6 +162,11 @@ export class UserController {
     return await this.userService.getNotificationsByUserId(res, req);
   }
 
+  @Post("getNotificationsPage")
+  async getNotificationsPage(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.getNotificationsPage(res, req);
+  }
+
   @Post("upsertToken")
   async upsertToken(@Res() res: Response, @Req() req: Request) {
     return await this.userService.registerFcm(res, req);

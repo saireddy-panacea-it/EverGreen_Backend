@@ -1777,17 +1777,10 @@ export class UserService {
     }
 
     equipment["tasks"] = tasks;
-    if (equipment) {
-      return res.send({
-        success: 200,
-        data: equipment,
-      });
-    } else {
-      return res.send({
-        success: 200,
-        message: `Data not found for equipment with id: ${equipment_link}`,
-      });
-    }
+    return res.send({
+      success: 200,
+      data: equipment,
+    });
   }
 
   async getHoldReasons(res, req) {

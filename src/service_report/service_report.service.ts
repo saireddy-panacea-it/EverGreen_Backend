@@ -104,12 +104,30 @@ export class ServiceReportService {
     return `${prefix}${String(next).padStart(5, "0")}`;
   }
 
-  async resolveCompany(body) {
-    const companyLink = parseInt(String(body?.company_link ?? ""), 10);
+  async resolveCompany(body): Promise<any> {
+    const rawCompanyLink = String(body?.company_link ?? "").trim();
+    const companyLink = /^\d+$/.test(rawCompanyLink) ? parseInt(rawCompanyLink, 10) : NaN;
     let company = null;
     if (Number.isFinite(companyLink) && companyLink > 0) {
-      company = await prisma.company.findUnique({ where: { id: companyLink } });
+      company = await prisma.company.findUnique({
+        where: { id: companyLink },
+        include: { address: true },
+      });
     }
+    if (rawCompanyLink && (!company || !Number.isFinite(companyLink) || companyLink <= 0)) {
+      return { error: { status: 404, message: "The selected company was not found" } };
+    }
+    const addressText = company?.address
+      ? [
+          company.address.address_line,
+          company.address.locality,
+          company.address.city,
+          company.address.district,
+          company.address.state,
+          company.address.pincode,
+          company.address.country,
+        ].filter(Boolean).join(", ")
+      : "";
     const companyName =
       this.text(body?.company_name) ||
       this.text(body?.company) ||
@@ -122,55 +140,188 @@ export class ServiceReportService {
         this.optional(body?.company_branch) ||
         this.optional(company?.branch_name),
       location:
-        this.optional(body?.location) || this.optional(company?.location),
+        this.optional(body?.location) || this.optional(company?.location) || this.optional(addressText),
+      address: addressText,
+      gst_number: this.optional(company?.gst_number),
       company_email:
         this.optional(body?.company_email) || this.optional(company?.email),
     };
   }
 
   payloadFromBody(body, companyInfo, actor: string, existing?: any) {
+    const value = (input, previous) =>
+      input !== undefined ? this.optional(input) : previous ?? null;
     const status =
       this.optional(body?.status) || existing?.status || "Not Started";
     return {
-      task_id: this.optional(body?.task_id ?? body?.taskId ?? body?.ticket_no),
+      task_id:
+        this.optional(body?.task_id ?? body?.taskId ?? body?.ticket_no ?? body?.task_link) ||
+        this.optional(existing?.task_id),
       company_link: companyInfo.company_link,
       company_name: companyInfo.company_name,
       company_branch: companyInfo.company_branch,
       location: companyInfo.location,
       company_email: companyInfo.company_email,
-      raised_by_name: this.optional(body?.raised_by_name),
-      raised_by_phone: this.optional(body?.raised_by_phone),
-      raised_by_email: this.optional(body?.raised_by_email),
-      raised_by_note: this.optional(body?.raised_by_note),
-      technician_name: this.optional(body?.technician_name),
-      technician_phone: this.optional(body?.technician_phone),
-      technician_note: this.optional(body?.technician_note),
-      equipment_name: this.optional(body?.equipment_name),
-      equipment_make: this.optional(body?.equipment_make),
-      equipment_model: this.optional(body?.equipment_model),
-      equipment_serial_number: this.optional(body?.equipment_serial_number),
+      raised_by_name: value(body?.raised_by_name, existing?.raised_by_name),
+      raised_by_phone: value(body?.raised_by_phone, existing?.raised_by_phone),
+      raised_by_email: value(body?.raised_by_email, existing?.raised_by_email),
+      raised_by_note: value(body?.raised_by_note, existing?.raised_by_note),
+      technician_name: value(body?.technician_name, existing?.technician_name),
+      technician_phone: value(body?.technician_phone, existing?.technician_phone),
+      technician_note: value(body?.technician_note, existing?.technician_note),
+      equipment_name: value(body?.equipment_name, existing?.equipment_name),
+      equipment_make: value(body?.equipment_make, existing?.equipment_make),
+      equipment_model: value(body?.equipment_model, existing?.equipment_model),
+      equipment_serial_number: value(body?.equipment_serial_number, existing?.equipment_serial_number),
       equipment_eg_serial_number: this.optional(
         body?.equipment_eg_serial_number,
-      ),
-      equipment_location: this.optional(body?.equipment_location),
-      call_type: this.optional(body?.call_type),
-      issue: this.optional(body?.issue),
-      issue_description: this.optional(body?.issue_description),
-      service_details: this.optional(body?.service_details),
+      ) ?? existing?.equipment_eg_serial_number ?? null,
+      equipment_location: value(body?.equipment_location, existing?.equipment_location),
+      call_type: value(body?.call_type, existing?.call_type),
+      issue: value(body?.issue, existing?.issue),
+      issue_description: value(body?.issue_description, existing?.issue_description),
+      service_details: value(body?.service_details, existing?.service_details),
       timeline_events: this.parseTimeline(
         body?.timeline_events ?? existing?.timeline_events,
       ) as Prisma.InputJsonValue,
-      customer_serviced_to_satisfaction: this.optional(
+      customer_serviced_to_satisfaction: value(
         body?.customer_serviced_to_satisfaction,
+        existing?.customer_serviced_to_satisfaction,
       ),
-      equipment_running_smoothly: this.optional(
+      equipment_running_smoothly: value(
         body?.equipment_running_smoothly,
+        existing?.equipment_running_smoothly,
       ),
-      customer_comments: this.optional(body?.customer_comments),
-      rating: this.optional(body?.rating),
-      cost: this.parseCost(body?.cost),
+      customer_comments: value(body?.customer_comments, existing?.customer_comments),
+      rating: value(body?.rating, existing?.rating),
+      cost: body?.cost !== undefined ? this.parseCost(body.cost) : existing?.cost ?? null,
       status,
       updated_by: actor,
+    };
+  }
+
+  async hydrateTaskReport(data): Promise<any> {
+    const rawTaskId = this.text(data?.task_id);
+    if (!rawTaskId) return { data };
+    const numericTaskId = /^\d+$/.test(rawTaskId) ? parseInt(rawTaskId, 10) : NaN;
+    const task = await prisma.tasks.findFirst({
+      where: {
+        OR: [
+          ...(Number.isFinite(numericTaskId) && numericTaskId > 0
+            ? [{ id: numericTaskId }]
+            : []),
+          { ticket_no: rawTaskId },
+        ],
+      },
+      include: {
+        task_user: { orderBy: { id: "asc" } },
+        equipment: { include: { company: { include: { address: true } } } },
+      },
+    });
+    if (!task) {
+      return { error: { status: 404, message: "The linked task or ticket was not found" } };
+    }
+    const company = task.equipment?.company;
+    if (!company?.name || !task.equipment?.name || !task.ticket_no) {
+      return {
+        error: {
+          status: 422,
+          message: "The linked task needs a ticket number, company, and equipment before a report can be generated",
+        },
+      };
+    }
+    if (data.company_link != null && data.company_link !== company.id) {
+      return {
+        error: {
+          status: 400,
+          message: "The report company does not match the linked task company",
+        },
+      };
+    }
+    const userIds = new Set<number>();
+    for (const assignment of task.task_user) {
+      if (assignment.technician_link) userIds.add(assignment.technician_link);
+      if (assignment.client_link) userIds.add(assignment.client_link);
+    }
+    const users = userIds.size
+      ? await prisma.user.findMany({
+          where: { id: { in: [...userIds] } },
+          select: { id: true, name: true, phone: true, email: true },
+        })
+      : [];
+    const userById = Object.fromEntries(users.map((item) => [item.id, item]));
+    const latestClientAssignment = [...task.task_user].reverse().find((item) => item.client_link);
+    const latestTechnicianAssignment = [...task.task_user].reverse().find((item) => item.technician_link);
+    const client = latestClientAssignment?.client_link
+      ? userById[latestClientAssignment.client_link]
+      : null;
+    const technician = latestTechnicianAssignment?.technician_link
+      ? userById[latestTechnicianAssignment.technician_link]
+      : null;
+    const statusLabels = {
+      open: "Not Started",
+      in_progress: "In Progress",
+      hold: "Hold",
+      completed: "Awaiting Approval",
+      closed: "Completed",
+    };
+    const timeline = task.task_user.map((row) => {
+      const assignedTech = row.technician_link ? userById[row.technician_link] : null;
+      const titles = {
+        open: row.technician_link ? "Technician assigned" : "Task created",
+        in_progress: "Work started",
+        hold: "Task placed on hold",
+        completed: "Work completed; awaiting approval",
+        closed: "Task approved",
+      };
+      return {
+        date: moment(row.updated_at || row.created_at).format("YYYY-MM-DD"),
+        time: moment(row.updated_at || row.created_at).format("hh:mm A"),
+        title: titles[row.status] || String(row.status),
+        description: row.reason || (assignedTech ? `Assigned to ${assignedTech.name || assignedTech.phone}` : ""),
+      };
+    });
+    const address = company.address
+      ? [company.address.address_line, company.address.locality, company.address.city,
+          company.address.district, company.address.state, company.address.pincode,
+          company.address.country].filter(Boolean).join(", ")
+      : "";
+    return {
+      data: {
+        ...data,
+        task_id: task.ticket_no,
+        company_link: company.id,
+        company_name: company.name,
+        company_branch: company.branch_name,
+        location: company.location || address || data.location,
+        company_email: company.email,
+        raised_by_name: client?.name || data.raised_by_name,
+        raised_by_phone: client?.phone || data.raised_by_phone,
+        raised_by_email: client?.email || data.raised_by_email,
+        technician_name: technician?.name || data.technician_name,
+        technician_phone: technician?.phone || data.technician_phone,
+        technician_note: technician ? "Assigned technician" : "Not assigned yet",
+        equipment_name: task.equipment.name,
+        equipment_make: task.equipment.make,
+        equipment_model: task.equipment.model,
+        equipment_serial_number: task.equipment.serial_number,
+        equipment_eg_serial_number: task.equipment.eg_serial_number,
+        equipment_location: task.equipment.location,
+        call_type: task.call_type ? String(task.call_type).replace(/_/g, " ").toUpperCase() : data.call_type,
+        issue: task.name || data.issue,
+        issue_description: task.description || data.issue_description,
+        service_details: task.action_taken || data.service_details,
+        timeline_events: data.timeline_events?.length ? data.timeline_events : timeline,
+        customer_serviced_to_satisfaction: task.service_satisfactory == null
+          ? data.customer_serviced_to_satisfaction
+          : task.service_satisfactory ? "Yes" : "No",
+        equipment_running_smoothly: task.is_running_smoothly == null
+          ? data.equipment_running_smoothly
+          : task.is_running_smoothly ? "Yes" : "No",
+        customer_comments: task.feedback || task.notes || data.customer_comments,
+        rating: task.rating == null ? data.rating : String(task.rating),
+        status: statusLabels[task.task_user[task.task_user.length - 1]?.status || task.status || "open"] || data.status,
+      },
     };
   }
 
@@ -204,7 +355,7 @@ export class ServiceReportService {
         : `₹${Number(report.cost).toLocaleString("en-IN")}`;
     return {
       service_report_number: report.service_report_number,
-      ticket_no: report.task_id || "-",
+      ticket_no: report.task_id || report.service_report_number,
       generated_at: this.formatTime(report.generated_at || report.created_at),
       current_status: report.status || "Not Started",
       status_key: String(report.status || "")
@@ -220,6 +371,18 @@ export class ServiceReportService {
         name: report.company_name,
         branch: report.company_branch,
         location: report.location,
+        address: report.company?.address
+          ? [
+              report.company.address.address_line,
+              report.company.address.locality,
+              report.company.address.city,
+              report.company.address.district,
+              report.company.address.state,
+              report.company.address.pincode,
+              report.company.address.country,
+            ].filter(Boolean).join(", ")
+          : report.location,
+        gst_number: report.company?.gst_number,
         email: report.company_email,
       },
       contact: {
@@ -257,18 +420,35 @@ export class ServiceReportService {
     };
   }
 
-  writePdf(report, includeBase64 = true) {
+  async writePdf(report, includeBase64 = true) {
     const folder = "./uploads/reports";
     if (!existsSync(folder)) mkdirSync(folder, { recursive: true });
-    const filePath = `${folder}/${report.service_report_number}.pdf`;
-    return buildServiceReportPdf(this.toPdfView(report)).then((bytes) => {
-      const pdfBuffer = Buffer.from(bytes);
-      writeFileSync(filePath, pdfBuffer);
-      return {
-        url: `uploads/reports/${report.service_report_number}.pdf`,
-        pdf_base64: includeBase64 ? pdfBuffer.toString("base64") : undefined,
-      };
-    });
+    const rawTaskId = String(report.task_id || "").trim();
+    const numericTaskId = /^\d+$/.test(rawTaskId) ? parseInt(rawTaskId, 10) : NaN;
+    const task = rawTaskId
+      ? await prisma.tasks.findFirst({
+          where: {
+            OR: [
+              ...(Number.isFinite(numericTaskId) && numericTaskId > 0 ? [{ id: numericTaskId }] : []),
+              { ticket_no: rawTaskId },
+            ],
+          },
+          select: { ticket_no: true },
+        })
+      : null;
+    const ticketNumber = String(task?.ticket_no || report.service_report_number)
+      .replace(/[^A-Za-z0-9_-]/g, "_");
+    const fileName = `Ticket_${ticketNumber}.pdf`;
+    const filePath = `${folder}/${fileName}`;
+    const view = this.toPdfView(report);
+    view.ticket_no = task?.ticket_no || report.service_report_number;
+    const bytes = await buildServiceReportPdf(view);
+    const pdfBuffer = Buffer.from(bytes);
+    writeFileSync(filePath, pdfBuffer);
+    return {
+      url: `uploads/reports/${fileName}`,
+      pdf_base64: includeBase64 ? pdfBuffer.toString("base64") : undefined,
+    };
   }
 
   async createServiceReport(res, req) {
@@ -276,14 +456,19 @@ export class ServiceReportService {
       const user = await this.requireManager(res, req);
       if (!user) return;
       const companyInfo = await this.resolveCompany(req.body || {});
-      if (!companyInfo.company_name) {
-        return res.status(400).send({
-          status: 400,
-          message: "Company/Customer is required",
-        });
+      if (companyInfo.error) {
+        return res.status(companyInfo.error.status).send(companyInfo.error);
       }
       const actor = user.phone;
-      const data = this.payloadFromBody(req.body || {}, companyInfo, actor);
+      let data = this.payloadFromBody(req.body || {}, companyInfo, actor);
+      const hydrated = await this.hydrateTaskReport(data);
+      if (hydrated.error) {
+        return res.status(hydrated.error.status).send(hydrated.error);
+      }
+      data = hydrated.data;
+      if (!data.company_name) {
+        return res.status(400).send({ status: 400, message: "Company/Customer is required" });
+      }
       let created
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
@@ -293,7 +478,7 @@ export class ServiceReportService {
               service_report_number: await this.nextReportNumber(),
               created_by: actor,
             },
-            include: { company: true },
+            include: { company: { include: { address: true } } },
           })
           break
         } catch (error) {
@@ -343,19 +528,27 @@ export class ServiceReportService {
         ...req.body,
         company_name: req.body?.company_name ?? existing.company_name,
       });
+      if (companyInfo.error) {
+        return res.status(companyInfo.error.status).send(companyInfo.error);
+      }
       if (!companyInfo.company_name) {
         return res.status(400).send({
           status: 400,
           message: "Company/Customer is required",
         });
       }
+      const updateData = this.payloadFromBody(req.body || {}, companyInfo, user.phone, existing);
+      const hydrated = await this.hydrateTaskReport(updateData);
+      if (hydrated.error) {
+        return res.status(hydrated.error.status).send(hydrated.error);
+      }
       const updated = await prisma.service_report.update({
         where: { id },
         data: {
-          ...this.payloadFromBody(req.body || {}, companyInfo, user.phone, existing),
+          ...hydrated.data,
           updated_at: new Date(),
         },
-        include: { company: true },
+        include: { company: { include: { address: true } } },
       });
       return res.status(200).send({
         status: 200,
@@ -408,7 +601,7 @@ export class ServiceReportService {
       const user = await this.requireManager(res, req);
       if (!user) return;
       const reports = await prisma.service_report.findMany({
-        include: { company: true },
+        include: { company: { include: { address: true } } },
         orderBy: { created_at: "desc" },
       });
       return res.status(200).send({
@@ -438,7 +631,7 @@ export class ServiceReportService {
       }
       const report = await prisma.service_report.findUnique({
         where: { id },
-        include: { company: true },
+        include: { company: { include: { address: true } } },
       });
       if (!report) {
         return res.status(404).send({
@@ -471,7 +664,10 @@ export class ServiceReportService {
           message: "Service report id is required",
         });
       }
-      const report = await prisma.service_report.findUnique({ where: { id } });
+      const report = await prisma.service_report.findUnique({
+        where: { id },
+        include: { company: { include: { address: true } } },
+      });
       if (!report) {
         return res.status(404).send({
           status: 404,
@@ -481,6 +677,7 @@ export class ServiceReportService {
       const updated = await prisma.service_report.update({
         where: { id },
         data: { generated_at: new Date(), updated_by: user.phone },
+        include: { company: { include: { address: true } } },
       });
       const file = await this.writePdf(updated, true);
       return res.status(200).send({
@@ -512,8 +709,8 @@ export class ServiceReportService {
         task = await prisma.tasks.findUnique({
           where: { id: numericId },
           include: {
-            task_user: { orderBy: { created_at: "asc" } },
-            equipment: { include: { company: true } },
+            task_user: { orderBy: { id: "asc" } },
+            equipment: { include: { company: { include: { address: true } } } },
           },
         });
       }
@@ -521,8 +718,8 @@ export class ServiceReportService {
         task = await prisma.tasks.findFirst({
           where: { ticket_no: rawTaskId },
           include: {
-            task_user: { orderBy: { created_at: "asc" } },
-            equipment: { include: { company: true } },
+            task_user: { orderBy: { id: "asc" } },
+            equipment: { include: { company: { include: { address: true } } } },
           },
         });
       }
@@ -549,15 +746,18 @@ export class ServiceReportService {
         : [];
       const userById = Object.fromEntries(users.map((item) => [item.id, item]));
       const latest = task.task_user[task.task_user.length - 1];
-      const client = latest?.client_link ? userById[latest.client_link] : null;
-      const technician = latest?.technician_link
-        ? userById[latest.technician_link]
+      const latestClient = [...task.task_user].reverse().find((row) => row.client_link);
+      const latestTechnician = [...task.task_user].reverse().find((row) => row.technician_link);
+      const client = latestClient?.client_link ? userById[latestClient.client_link] : null;
+      const technician = latestTechnician?.technician_link
+        ? userById[latestTechnician.technician_link]
         : null;
       const statusMap = {
         open: "Not Started",
         in_progress: "In Progress",
         hold: "Hold",
         closed: "Completed",
+        completed: "Awaiting Approval",
       };
       const timeline = [
         {
@@ -571,14 +771,19 @@ export class ServiceReportService {
       ];
       for (const row of task.task_user) {
         const tech = row.technician_link ? userById[row.technician_link] : null;
-        if (row.technician_link) {
-          timeline.push({
-            date: moment(row.updated_at || row.created_at).format("YYYY-MM-DD"),
-            time: moment(row.updated_at || row.created_at).format("hh:mm A"),
-            title: "Technician assigned",
-            description: `${tech?.name || "Technician"} was assigned to this task.`,
-          });
-        }
+        const titleByStatus = {
+          open: row.technician_link ? "Technician assigned" : "Awaiting technician",
+          in_progress: "Work started",
+          hold: "Task placed on hold",
+          completed: "Work completed; awaiting approval",
+          closed: "Task approved",
+        };
+        timeline.push({
+          date: moment(row.updated_at || row.created_at).format("YYYY-MM-DD"),
+          time: moment(row.updated_at || row.created_at).format("hh:mm A"),
+          title: titleByStatus[row.status] || String(row.status),
+          description: row.reason || (tech ? `${tech.name || "Technician"} was assigned to this task.` : ""),
+        });
       }
       return res.status(200).send({
         status: 200,
@@ -590,6 +795,13 @@ export class ServiceReportService {
           company_branch: task.equipment?.company?.branch_name || "",
           location: task.equipment?.company?.location || "",
           company_email: task.equipment?.company?.email || "",
+          company_address: task.equipment?.company?.address
+            ? [task.equipment.company.address.address_line, task.equipment.company.address.locality,
+                task.equipment.company.address.city, task.equipment.company.address.district,
+                task.equipment.company.address.state, task.equipment.company.address.pincode,
+                task.equipment.company.address.country].filter(Boolean).join(", ")
+            : "",
+          company_gst_number: task.equipment?.company?.gst_number || "",
           raised_by_name: client?.name || "",
           raised_by_phone: client?.phone || "",
           raised_by_email: client?.email || "",

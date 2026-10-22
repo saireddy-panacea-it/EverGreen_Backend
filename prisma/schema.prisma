@@ -17,6 +17,7 @@ model user {
   password          String       @db.VarChar(20)
   notes             String?      @db.VarChar(500)
   access_level      access_level @default(client)
+  designation       String?      @db.VarChar(50)
   pan_id            String?      @db.VarChar(20)
   aadhaar_id        String?      @db.VarChar(20)
   permanent_address String?      @db.VarChar(500)
@@ -121,6 +122,7 @@ enum status {
   open
   hold
   in_progress
+  completed
   closed
 }
 

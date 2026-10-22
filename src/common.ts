@@ -69,6 +69,9 @@ export function mapStatusToEnum(dbStatus): status | undefined {
       return status.hold;
     case "in_progress":
       return status.in_progress;
+    case "completed":
+    case "complete":
+      return status.completed;
     case "closed":
       return status.closed;
     default:

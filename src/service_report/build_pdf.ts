@@ -127,7 +127,8 @@ export async function buildServiceReportPdf(view: any): Promise<Uint8Array> {
       lines: [
         view.company?.name || "-",
         view.company?.branch || "",
-        view.company?.location || "-",
+        view.company?.address || view.company?.location || "-",
+        view.company?.gst_number ? `GST: ${view.company.gst_number}` : "",
         view.company?.email || "",
       ],
     },
@@ -284,6 +285,21 @@ export async function buildServiceReportPdf(view: any): Promise<Uint8Array> {
         if (index === 0) {
           // keep label only on first line
         }
+      });
+    });
+    y -= 6;
+  }
+
+  const attachments = Array.isArray(view.images) ? view.images.filter(Boolean) : [];
+  if (attachments.length) {
+    section("TASK PHOTOS / ATTACHMENTS");
+    attachments.forEach((attachment, index) => {
+      const cleanPath = String(attachment).split(/[?#]/)[0];
+      const label = cleanPath.split(/[\\/]/).pop() || `Attachment ${index + 1}`;
+      wrap(`${index + 1}. ${label}`, contentWidth - 8, 9).forEach((line) => {
+        ensure(13);
+        text(line, MARGIN + 2, y, 9, regular, NAVY);
+        y -= 12;
       });
     });
     y -= 6;

@@ -44,6 +44,14 @@ export class UserService {
     private readonly notificationService: NotificationService,
   ) {}
   async createUser(res, req) {
+    const technicianRole = this.isTechnicianRole(req.body.access_level);
+    const designation = this.normalizeTechnicianDesignation(req.body.designation);
+    if (technicianRole && req.body.designation && !designation) {
+      return res.status(HttpStatus.BAD_REQUEST).send({
+        status: HttpStatus.BAD_REQUEST,
+        message: "designation must be Senior Service Engineer or Junior Technician",
+      });
+    }
     const user: user = {
       id: undefined,
       name: req.body.name,
@@ -52,6 +60,7 @@ export class UserService {
       email: req.body.email,
       notes: req.body.notes,
       access_level: req.body.access_level,
+      designation: technicianRole ? designation : null,
       pan_id: req.body.pan_id,
       aadhaar_id: req.body.aadhaar_id,
       permanent_address: req.body.permanent_address,
@@ -163,6 +172,18 @@ export class UserService {
       },
     });
     if (existingUser) {
+      const nextAccessLevel = req.body.access_level ?? existingUser.access_level;
+      const designation = this.normalizeTechnicianDesignation(req.body.designation);
+      if (
+        this.isTechnicianRole(nextAccessLevel) &&
+        req.body.designation &&
+        !designation
+      ) {
+        return res.status(HttpStatus.BAD_REQUEST).send({
+          status: HttpStatus.BAD_REQUEST,
+          message: "designation must be Senior Service Engineer or Junior Technician",
+        });
+      }
       if (req.body.email && String(req.body.email).trim() !== "") {
         const emailTaken = await prisma.user.findFirst({
           where: {
@@ -181,6 +202,9 @@ export class UserService {
         name: req.body.name ?? existingUser?.name,
         location: req.body.location ?? existingUser?.location,
         access_level: req.body.access_level ?? existingUser?.access_level,
+        designation: this.isTechnicianRole(nextAccessLevel)
+          ? designation ?? existingUser.designation
+          : null,
         email: req.body.email ?? existingUser?.email,
         phone: req.body.phone ?? existingUser?.phone,
         updated_by: req.body.phone ?? existingUser?.phone,
@@ -336,6 +360,7 @@ export class UserService {
           notes: req.body.notes,
           password: adminPassword,
           access_level: access_level.client_admin,
+          designation: null,
           pan_id: "",
           aadhaar_id: "",
           permanent_address: "",
@@ -1600,6 +1625,59 @@ export class UserService {
         status: 404,
       });
     }
+    const actorId = Number(req.user?.sub);
+    const actorRole = String(userInfo?.access_level ?? "").toLowerCase();
+    const isAdminOrManager = this.adminOrNot(userInfo?.access_level);
+    const isAssignedServiceEngineer =
+      actorRole === "technician" &&
+      Number(dbTaskUser.technician_link) === actorId;
+    let isLinkedCompanyUser = false;
+    if (
+      actorRole === "client_admin" &&
+      dbTaskUser.task?.equipment?.company_link != null
+    ) {
+      const companyLink = await prisma.company_user.findUnique({
+        where: {
+          user_link_company_link: {
+            user_link: actorId,
+            company_link: dbTaskUser.task.equipment.company_link,
+          },
+        },
+        select: { user_link: true },
+      });
+      isLinkedCompanyUser = companyLink != null;
+    }
+    if (!isAdminOrManager && !isAssignedServiceEngineer && !isLinkedCompanyUser) {
+      return res.status(HttpStatus.FORBIDDEN).send({
+        message: "You do not have permission to update this task status",
+        status: HttpStatus.FORBIDDEN,
+      });
+    }
+    const isApprover = ["eg_super_admin", "eg_admin", "client_admin"].includes(actorRole);
+    if (taskStatus === status.closed && dbTaskUser.status === status.completed && !isApprover) {
+      return res.status(HttpStatus.FORBIDDEN).send({
+        message: "Only an Admin, Client Admin, or Manager can approve a completed task",
+        status: HttpStatus.FORBIDDEN,
+      });
+    }
+    if (actorRole === "technician" &&
+        taskStatus !== status.in_progress &&
+        taskStatus !== status.hold &&
+        taskStatus !== status.completed) {
+      return res.status(HttpStatus.FORBIDDEN).send({
+        message: "Technicians can move assigned tasks to In Progress, Hold, or Completed",
+        status: HttpStatus.FORBIDDEN,
+      });
+    }
+    const legacyFollowUpAwaitingApproval =
+      dbTaskUser.status === status.in_progress && dbTaskUser.task?.follow_up === true;
+    if (taskStatus === status.closed && dbTaskUser.status !== status.completed &&
+        !legacyFollowUpAwaitingApproval && !isAdminOrManager) {
+      return res.status(HttpStatus.CONFLICT).send({
+        message: "Only completed tasks can be approved",
+        status: HttpStatus.CONFLICT,
+      });
+    }
     const dbTask = await prisma.tasks.findUnique({
       where: {
         id: dbTaskUser.task_link,
@@ -1658,7 +1736,7 @@ export class UserService {
           updatedByName: userInfo?.name ?? userInfo?.phone,
           actorUserId: userInfo?.id,
           notes: req.body.reason,
-          isCompleted: taskStatus === status.closed,
+          isCompleted: taskStatus === status.completed || taskStatus === status.closed,
         });
       } catch (notifyError) {
         console.error("updateTaskStatus notification failed", notifyError);
@@ -1666,7 +1744,7 @@ export class UserService {
     }
 
     const taskLatestStatus = await this.getLatestStatusForTask(dbTask.id);
-    if (taskLatestStatus == status.hold) {
+    if (taskLatestStatus == status.hold && req.body.hold) {
       const dbHold = {
         hold: req.body.hold.hold_reason,
         is_active: true,
@@ -1825,6 +1903,13 @@ export class UserService {
   async clientSignatureForReport(res, req) {
     try {
       const requester = await this.findOne(req.user.phone);
+      if (!this.adminOrNot(requester?.access_level) &&
+          requester?.access_level !== access_level.client_admin) {
+        return res.status(HttpStatus.FORBIDDEN).send({
+          status: HttpStatus.FORBIDDEN,
+          message: "Only an Admin, Client Admin, or Manager can approve a task",
+        });
+      }
       const taskLink = await this.resolveTaskLink(
         req.body.task_link ?? req.body.task_user_link
       );
@@ -1895,6 +1980,21 @@ export class UserService {
       };
     }
 
+    const latest = await prisma.task_user.findFirst({
+      where: { task_link: taskLink },
+      orderBy: { id: "desc" },
+    });
+    const awaitingApproval = latest?.status === status.completed ||
+      (latest?.status === status.in_progress && task.follow_up === true);
+    if (!awaitingApproval) {
+      return {
+        error: {
+          status: HttpStatus.CONFLICT,
+          message: "Only completed tasks can be approved",
+        },
+      };
+    }
+
     const rating = this.coerceRating(req.body.rating);
     const hasApprovalFields =
       req.body.feedback != null ||
@@ -1918,10 +2018,6 @@ export class UserService {
       });
     }
 
-    const latest = await prisma.task_user.findFirst({
-      where: { task_link: taskLink },
-      orderBy: { id: "desc" },
-    });
     if (latest && latest.status !== status.closed) {
       await prisma.task_user.update({
         where: { id: latest.id },
@@ -2019,8 +2115,10 @@ export class UserService {
         return "In Progress";
       case "hold":
         return "Hold";
+      case "completed":
+        return "Awaiting Approval";
       case "closed":
-        return "Closed";
+        return "Completed";
       default:
         return value || "Open";
     }
@@ -2041,14 +2139,22 @@ export class UserService {
     const task = await prisma.tasks.findUnique({
       where: { id: taskLink },
       include: {
-        task_user: { orderBy: { created_at: "asc" } },
+        task_user: { orderBy: { id: "asc" } },
         hold_reason: { orderBy: { created_at: "asc" } },
         image: true,
-        equipment: { include: { company: true } },
+        equipment: { include: { company: { include: { address: true } } } },
       },
     });
     if (!task) {
       return { error: { status: 404, message: "Task not found" } };
+    }
+    if (!task.ticket_no || !task.equipment?.name || !task.equipment?.company?.name) {
+      return {
+        error: {
+          status: 422,
+          message: "A report requires a ticket number, company, and equipment on the task",
+        },
+      };
     }
     if (!this.canAccessCompany(requester, task.equipment?.company_link)) {
       return {
@@ -2072,9 +2178,11 @@ export class UserService {
       : [];
     const userById = Object.fromEntries(users.map((item) => [item.id, item]));
     const latest = task.task_user[task.task_user.length - 1];
-    const client = latest?.client_link ? userById[latest.client_link] : null;
-    const technician = latest?.technician_link
-      ? userById[latest.technician_link]
+    const latestClient = [...task.task_user].reverse().find((row) => row.client_link);
+    const latestTechnician = [...task.task_user].reverse().find((row) => row.technician_link);
+    const client = latestClient?.client_link ? userById[latestClient.client_link] : null;
+    const technician = latestTechnician?.technician_link
+      ? userById[latestTechnician.technician_link]
       : null;
     const currentStatus = latest?.status || "open";
 
@@ -2113,11 +2221,17 @@ export class UserService {
           title: "Task put on hold",
           detail: row.reason || `${actor} placed the task on hold.`,
         });
+      } else if (row.status === "completed") {
+        timeline.push({
+          time: this.formatReportTime(row.updated_at || row.created_at),
+          title: "Work completed; awaiting approval",
+          detail: `${tech?.name || actor} marked the task complete.`,
+        });
       } else if (row.status === "closed") {
         timeline.push({
           time: this.formatReportTime(row.updated_at || row.created_at),
-          title: "Task closed",
-          detail: `Service completed${tech?.name ? ` by ${tech.name}` : ""}.`,
+          title: "Task approved",
+          detail: `Service completed and approved${tech?.name ? ` for work by ${tech.name}` : ""}.`,
         });
       }
     }
@@ -2138,7 +2252,28 @@ export class UserService {
       return left - right;
     });
 
-    const images = [];
+    let outputImages: string[] = [];
+    if (task.out_images) {
+      try {
+        const parsed = typeof task.out_images === "string"
+          ? JSON.parse(task.out_images)
+          : task.out_images;
+        if (Array.isArray(parsed)) outputImages = parsed.map((value) => String(value)).filter(Boolean);
+      } catch {
+        outputImages = [String(task.out_images)];
+      }
+    }
+    const images = [
+      ...task.image.map((item) => item.url),
+      ...outputImages,
+      ...(task.hold_reason || []).map((hold) => hold.image).filter(Boolean),
+    ].filter(Boolean);
+    const address = task.equipment?.company?.address;
+    const formattedCompanyAddress = address
+      ? [address.address_line, address.locality, address.city, address.district, address.state, address.pincode, address.country]
+          .filter(Boolean)
+          .join(", ")
+      : "";
 
     return {
       ticket_no: task.ticket_no,
@@ -2154,7 +2289,9 @@ export class UserService {
       company: {
         name: task.equipment?.company?.name,
         branch: task.equipment?.company?.branch_name,
-        location: task.equipment?.company?.location,
+        location: task.equipment?.company?.location || formattedCompanyAddress,
+        address: formattedCompanyAddress,
+        gst_number: task.equipment?.company?.gst_number,
         email: task.equipment?.company?.email,
       },
       contact: {
@@ -2193,11 +2330,17 @@ export class UserService {
 
   async writeServiceReportPdf(taskLink, view, includeBase64 = true) {
     this.ensureUploadPath("./uploads/reports");
-    const filePath = `./uploads/reports/file-${taskLink}.pdf`;
+    const task = await prisma.tasks.findUnique({
+      where: { id: taskLink },
+      select: { ticket_no: true },
+    });
+    const ticketNumber = String(task?.ticket_no || taskLink).replace(/[^A-Za-z0-9_-]/g, "_");
+    const fileName = `Ticket_${ticketNumber}.pdf`;
+    const filePath = `./uploads/reports/${fileName}`;
     const pdfBuffer = Buffer.from(await buildServiceReportPdf(view));
     writeFileSync(filePath, pdfBuffer);
     return {
-      url: `uploads/reports/file-${taskLink}.pdf`,
+      url: `uploads/reports/${fileName}`,
       pdf_base64: includeBase64 ? pdfBuffer.toString("base64") : undefined,
     };
   }
@@ -2421,14 +2564,13 @@ export class UserService {
     // });
 
     const filteredTasks = taskUsers.filter((task) => {
-      const isTechnicianLinkValid = task.technician_link == null;
       const actorId = parseInt(String(userInfo?.id ?? user.sub ?? ""), 10);
       const myTask = task.technician_link == actorId;
       const isCompanyLinked = companyLinks.includes(
         task.task.equipment.company_link
       );
       if (userInfo.access_level == access_level.technician) {
-        return myTask || isTechnicianLinkValid;
+        return myTask;
       } else if (
         userInfo.access_level == access_level.client ||
         userInfo.access_level == access_level.client_admin
@@ -2536,6 +2678,7 @@ export class UserService {
 
   calculateCounts(data: any[]): {
     open: number;
+    completed: number;
     closed: number;
     hold: number;
     in_progress: number;
@@ -2543,6 +2686,7 @@ export class UserService {
     let openCount = 0;
     let inProgressCount = 0;
     let closedCount = 0;
+    let completedCount = 0;
     let holdCount = 0;
 
     for (const item of data) {
@@ -2550,6 +2694,8 @@ export class UserService {
         openCount++;
       } else if (item.status === "closed") {
         closedCount++;
+      } else if (item.status === "completed") {
+        completedCount++;
       } else if (item.status === "in_progress") {
         inProgressCount++;
       } else if (item.status === "hold") {
@@ -2559,6 +2705,7 @@ export class UserService {
 
     return {
       open: openCount,
+      completed: completedCount,
       closed: closedCount,
       in_progress: inProgressCount,
       hold: holdCount,
@@ -2587,6 +2734,29 @@ export class UserService {
         });
       }
 
+      const actor = await this.findOne(req.user?.phone);
+      const latestAssignment = await prisma.task_user.findFirst({
+        where: { task_link: taskLink },
+        orderBy: { id: "desc" },
+      });
+      const equipmentForAccess = task.equipment_link == null
+        ? null
+        : await prisma.equipment.findUnique({
+            where: { id: task.equipment_link },
+            select: { company_link: true },
+          });
+      const authorizedFeedbackRole =
+        this.adminOrNot(actor?.access_level) ||
+        (actor?.access_level === access_level.technician && latestAssignment?.technician_link === actor.id) ||
+        (actor?.access_level === access_level.client_admin &&
+          this.canAccessCompany(actor, equipmentForAccess?.company_link));
+      if (!authorizedFeedbackRole) {
+        return res.status(HttpStatus.FORBIDDEN).send({
+          message: "You do not have permission to update this task",
+          status: HttpStatus.FORBIDDEN,
+        });
+      }
+
       const updateTask = await prisma.tasks.update({
         where: { id: taskLink },
         data: {
@@ -2609,8 +2779,20 @@ export class UserService {
         },
       });
 
+      if (actor?.access_level === access_level.technician) {
+        if (latestAssignment && (req.body.action_taken != null || req.body.out_images != null)) {
+          await prisma.task_user.update({
+            where: { id: latestAssignment.id },
+            data: {
+              status: status.completed,
+              updated_by: req.user.phone,
+              updated_at: new Date(),
+            },
+          });
+        }
+      }
+
       try {
-        const actor = await this.findOne(req.user?.phone);
         const latestAssignment = await prisma.task_user.findFirst({
           where: { task_link: taskLink },
           orderBy: { id: "desc" },
@@ -2796,11 +2978,41 @@ export class UserService {
   }
 
   async getAllUser(res, req) {
+    const requester = await this.findOne(req.user?.phone);
+    if (!requester || !this.adminOrNot(requester.access_level)) {
+      return res.status(HttpStatus.FORBIDDEN).send({
+        status: HttpStatus.FORBIDDEN,
+        message: "You do not have access to the user list",
+      });
+    }
     const dbAccessLevel = mapAccessLevelToEnum(req.body.access_level);
-    const users = await prisma.user.findMany({
-      where: {
-        access_level: dbAccessLevel ?? undefined,
+    const designation = req.body.designation;
+    const where: any = { access_level: dbAccessLevel ?? undefined };
+    if (designation === "unclassified") {
+      where.OR = [{ designation: null }, { designation: "" }];
+    } else if (designation) {
+      where.designation = designation;
+    }
+    const rawUsers = await prisma.user.findMany({
+      where,
+      include: {
+        company_user: {
+          include: {
+            company: { select: { id: true, name: true, branch_name: true } },
+          },
+        },
       },
+    });
+    const users = rawUsers.map(({ company_user, ...item }) => {
+      const companies = company_user.map(({ company }) => company);
+      return {
+        ...item,
+        companies,
+        company_name: companies
+          .map((company) => [company.name, company.branch_name].filter(Boolean).join(" - "))
+          .filter(Boolean)
+          .join(", "),
+      };
     });
     // Fetch count of users grouped by access_level
     const userCounts = await prisma.user.groupBy({
@@ -2815,6 +3027,15 @@ export class UserService {
       acc[item.access_level] = item._count.access_level;
       return acc;
     }, {});
+    const technicianDesignations = await prisma.user.groupBy({
+      by: ["designation"],
+      where: { access_level: access_level.technician },
+      _count: { designation: true },
+    });
+    for (const row of technicianDesignations) {
+      const key = row.designation || "unclassified";
+      userCountsObj[key] = row._count.designation;
+    }
 
     return res.status(200).send({
       status: 200,
@@ -3198,10 +3419,13 @@ export class UserService {
           this.excelCellText(record.mobile);
         const email = this.excelCellText(record.email);
         const password = this.excelCellText(record.password);
+        const designation = this.normalizeTechnicianDesignation(
+          this.excelCellText(record.designation)
+        );
         if (!name && !phone && !email) continue;
-        if (!name || !phone || !email || !password) {
+        if (!name || !phone || !email || !password || !designation) {
           errors.push(
-            `Row ${item.rowNumber}: name, phone, email and password are required`
+            `Row ${item.rowNumber}: name, phone, email, password and a valid designation are required`
           );
           continue;
         }
@@ -3229,6 +3453,7 @@ export class UserService {
             password,
             location: this.excelCellText(record.location) || "",
             access_level: access_level.technician,
+            designation,
             created_by: userPhone,
             updated_by: userPhone,
           },
@@ -3249,6 +3474,13 @@ export class UserService {
         message: `Failed to upload technician data ${e}`,
       });
     }
+  }
+
+  private normalizeTechnicianDesignation(value: unknown): string | null {
+    const normalized = String(value ?? "").trim().toLowerCase();
+    if (normalized === "senior service engineer") return "Senior Service Engineer";
+    if (normalized === "junior technician") return "Junior Technician";
+    return null;
   }
 
   private uploadSummary(

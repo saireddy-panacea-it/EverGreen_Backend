@@ -36,6 +36,7 @@ model company {
   name                String?   @db.VarChar(200)
   branch_name         String?   @db.VarChar(50) // no-foreign-key relationship with smart_meter.id on purpose to avoid circular referencing
   email               String?   @db.VarChar(100) // TODO: @unique(map: "UK__user_email")
+  gst_number          String?   @db.VarChar(15)
   start_date          DateTime?
   end_date            DateTime?
   location            String?

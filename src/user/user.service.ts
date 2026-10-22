@@ -279,85 +279,99 @@ export class UserService {
       }
 
       const userPhone = req.user.phone;
+      const companyAddress = String(req.body.company_location ?? "").trim();
+      const gstNumber = String(req.body.gst_number ?? "").trim().toUpperCase();
+      if (!companyName) {
+        return res.send({ message: "Please enter company name", status: HttpStatus.BAD_REQUEST });
+      }
+      if (!branchName) {
+        return res.send({ message: "Please enter branch name", status: HttpStatus.BAD_REQUEST });
+      }
+      if (!companyAddress) {
+        return res.send({ message: "Please enter company address", status: HttpStatus.BAD_REQUEST });
+      }
+      if (!/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(gstNumber)) {
+        return res.send({ message: "Please enter a valid GST number", status: HttpStatus.BAD_REQUEST });
+      }
+
+      const startDateRaw = String(req.body.start_date ?? "").trim();
+      const endDateRaw = String(req.body.end_date ?? "").trim();
+      const startDate = startDateRaw
+        ? moment.utc(startDateRaw, "YYYY-MM-DD", true).startOf("day")
+        : null;
+      const endDate = endDateRaw
+        ? moment.utc(endDateRaw, "YYYY-MM-DD", true).startOf("day")
+        : null;
+      if (startDate && !startDate.isValid()) {
+        return res.send({ message: "Invalid start date", status: HttpStatus.BAD_REQUEST });
+      }
+      if (endDate && !endDate.isValid()) {
+        return res.send({ message: "Invalid end date", status: HttpStatus.BAD_REQUEST });
+      }
+
+      const adminName = String(req.body.name ?? "").trim();
       const mobile = String(req.body.phone ?? "").trim();
-
-      if (!mobile) {
+      const adminEmail = String(req.body.email ?? "").trim();
+      const adminPassword = String(req.body.password ?? "").trim();
+      const hasClientAdminDetails = [adminName, mobile, adminEmail, adminPassword].some(Boolean);
+      if (hasClientAdminDetails && (!adminName || !mobile || !adminEmail || !adminPassword)) {
         return res.send({
-          message: "PLEASE ENTER MOBILE NUMBER",
+          message: "Please provide all client admin details or leave them all empty",
           status: HttpStatus.BAD_REQUEST,
         });
       }
 
-      const mobileRegex = /^(\+\d{1,3}[- ]?)?\d{10}$/;
-      if (!mobileRegex.test(mobile)) {
-        return res.send({
-          message: "Please enter valid mobile number",
-          status: HttpStatus.BAD_REQUEST,
-        });
-      }
+      let userData: user | null = null;
+      if (hasClientAdminDetails) {
+        const mobileRegex = /^(\+\d{1,3}[- ]?)?\d{10}$/;
+        if (!mobileRegex.test(mobile)) {
+          return res.send({ message: "Please enter valid mobile number", status: HttpStatus.BAD_REQUEST });
+        }
+        userData = {
+          id: undefined,
+          name: adminName,
+          location: String(req.body.location ?? companyAddress).trim(),
+          phone: mobile,
+          email: adminEmail,
+          notes: req.body.notes,
+          password: adminPassword,
+          access_level: access_level.client_admin,
+          pan_id: "",
+          aadhaar_id: "",
+          permanent_address: "",
+          created_at: undefined,
+          created_by: userPhone,
+          updated_at: undefined,
+          updated_by: userPhone,
+        };
 
-      // Prepare user object
-      const userData: user = {
-        id: undefined,
-        name: String(req.body.name ?? "").trim(),
-        location: req.body.location,
-        phone: mobile,
-        email: String(req.body.email ?? "").trim(),
-        notes: req.body.notes,
-        password: String(req.body.password ?? "").trim(),
-        access_level: access_level.client_admin,
-        pan_id: "",
-        aadhaar_id: "",
-        permanent_address: "",
-        created_at: undefined,
-        created_by: userPhone,
-        updated_at: undefined,
-        updated_by: userPhone,
-      };
-
-      // Check if user already exists
-      const existingUser = await prisma.user.findFirst({
-        where: { phone: userData.phone },
-      });
-      if (existingUser) {
-        return res.send({
-          message: `user already exists with phone ${existingUser.phone}`,
-          status: HttpStatus.NO_CONTENT,
-        });
-      }
-
-      if (userData.email && String(userData.email).trim() !== "") {
+        const existingUser = await prisma.user.findFirst({ where: { phone: mobile } });
+        if (existingUser) {
+          return res.send({
+            message: `user already exists with phone ${existingUser.phone}`,
+            status: HttpStatus.NO_CONTENT,
+          });
+        }
         const existingEmail = await prisma.user.findFirst({
-          where: {
-            email: {
-              equals: String(userData.email).trim(),
-              mode: "insensitive",
-            },
-          },
+          where: { email: { equals: adminEmail, mode: "insensitive" } },
         });
         if (existingEmail) {
           return res.send({
-            message: `This email is already used by another user`,
+            message: "This email is already used by another user",
             status: HttpStatus.NO_CONTENT,
           });
         }
       }
 
-      // Prepare company object
       const companyData = {
         id: undefined,
-        name: req.body.company_name,
-        branch_name: req.body.branch_name,
+        name: companyName,
+        branch_name: branchName,
         email: req.body.company_email,
-        start_date: moment
-          .utc(req.body.start_date, "YYYY-MM-DD", true)
-          .startOf("day")
-          .toDate(),
-        end_date: moment
-          .utc(req.body.end_date, "YYYY-MM-DD", true)
-          .startOf("day")
-          .toDate(),
-        location: req.body.company_location,
+        start_date: startDate?.toDate() ?? null,
+        end_date: endDate?.toDate() ?? null,
+        location: companyAddress,
+        gst_number: gstNumber,
         logo: req.body.logo,
         created_at: undefined,
         created_by: userPhone,
@@ -366,7 +380,6 @@ export class UserService {
         address_link: null,
       };
 
-      // Check if company already exists
       const existingCompany = await prisma.company.findUnique({
         where: {
           company_name_branch_name: {
@@ -382,41 +395,25 @@ export class UserService {
         });
       }
 
-      if (!moment.utc(req.body.start_date, "YYYY-MM-DD", true).isValid()) {
-        return res.send({
-          message: "Invalid start date",
-          status: HttpStatus.BAD_REQUEST,
+      const created = await prisma.$transaction(async (transaction) => {
+        const company = await transaction.company.create({ data: companyData });
+        if (!userData) return { company, admin: null };
+        const admin = await transaction.user.create({ data: userData });
+        await transaction.company_user.create({
+          data: { company_link: company.id, user_link: admin.id },
         });
-      }
-
-      if (!moment.utc(req.body.end_date, "YYYY-MM-DD", true).isValid()) {
-        return res.send({
-          message: "Invalid end date",
-          status: HttpStatus.BAD_REQUEST,
-        });
-      }
-
-      // Create user and company in parallel
-      const [dbUser, dbCompany] = await Promise.all([
-        prisma.user.create({ data: userData }),
-        prisma.company.create({ data: companyData }),
-      ]);
-
-      // Link user to company
-      await prisma.company_user.create({
-        data: {
-          company_link: dbCompany.id,
-          user_link: dbUser.id,
-        },
+        return { company, admin };
       });
+      const dbCompany = created.company;
+      const dbUser = created.admin;
 
       try {
-        if (dbUser.email.trim().length > 0 && dbUser.password.trim().length > 0) {
+        if (dbUser?.email.trim() && dbUser.password.trim()) {
           await this.notificationService.sendCredentialsEmail(dbUser);
         }
         await this.notificationService.onNewAmc({
           companyName: dbCompany.name,
-          managerName: dbUser.name,
+          managerName: dbUser?.name ?? "No client admin assigned",
           location: dbCompany.location,
         });
       } catch (notifyError) {
@@ -424,7 +421,7 @@ export class UserService {
       }
 
       return res.status(200).send({
-        message: `company created successfully`,
+        message: "company created successfully",
         status: 200,
         data: dbCompany,
       });
@@ -482,16 +479,23 @@ export class UserService {
       ).trim();
       const startDateRaw = String(req.body.start_date ?? "").trim();
       const endDateRaw = String(req.body.end_date ?? "").trim();
+      const gstNumber = String(req.body.gst_number ?? "").trim().toUpperCase();
 
       if (companyName.length === 0) {
         return res.send({
-          message: "Please enter site name",
+          message: "Please enter company name",
           status: HttpStatus.BAD_REQUEST,
         });
       }
       if (branchName.length === 0) {
         return res.send({
           message: "Please enter branch name",
+          status: HttpStatus.BAD_REQUEST,
+        });
+      }
+      if (gstNumber && !/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(gstNumber)) {
+        return res.send({
+          message: "Please enter a valid GST number",
           status: HttpStatus.BAD_REQUEST,
         });
       }
@@ -544,6 +548,7 @@ export class UserService {
           location: String(
             req.body.company_location ?? existingCompany.location ?? ""
           ),
+          gst_number: gstNumber || existingCompany.gst_number,
           logo: String(req.body.logo ?? existingCompany.logo ?? ""),
           start_date: parsedStartDate ?? undefined,
           end_date: parsedEndDate ?? undefined,

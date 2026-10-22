@@ -331,7 +331,7 @@ Please review this task in the EverGreen app.`,
   async onTechnicianAssigned(opts: {
     task: any;
     equipment: any;
-    companyLink: number;
+    companyLink?: number | null;
     companyName: string;
     technicianName: string;
     technicianUserId: number;
@@ -354,13 +354,15 @@ Please review this task in the EverGreen app.`,
       opts.assignedByUserId,
     );
 
-    await this.pushToLevels(
-      [ROLE.AMC_MANAGER],
-      opts.companyLink,
-      'Technician assigned',
-      payload,
-      opts.assignedByUserId,
-    );
+    if (opts.companyLink != null) {
+      await this.pushToLevels(
+        [ROLE.AMC_MANAGER],
+        opts.companyLink,
+        'Technician assigned',
+        payload,
+        opts.assignedByUserId,
+      );
+    }
 
     if (!opts.selfAssigned && opts.technicianUserId) {
       await this.pushToUsers(
@@ -373,6 +375,99 @@ Please review this task in the EverGreen app.`,
           action: '',
         },
       );
+    }
+  }
+
+  async runUnassignedTaskAutoAssignment() {
+    const eligibleBefore = new Date(Date.now() - 15 * 60 * 1000);
+    const technicians = await prisma.user.findMany({
+      where: { access_level: ROLE.TECHNICIAN },
+      select: { id: true, name: true, phone: true },
+      orderBy: { id: 'asc' },
+    });
+    if (!technicians.length) return;
+
+    // Use only the latest assignment record for each task when counting workload.
+    const workload = new Map(technicians.map((technician) => [technician.id, 0]));
+    const assignedTasks = await prisma.tasks.findMany({
+      where: { task_user: { some: { technician_link: { not: null } } } },
+      select: {
+        task_user: {
+          orderBy: { id: 'desc' },
+          take: 1,
+          select: { technician_link: true, status: true },
+        },
+      },
+    });
+    for (const task of assignedTasks) {
+      const assignment = task.task_user[0];
+      if (!assignment) continue;
+      if (
+        assignment.technician_link != null &&
+        assignment.status !== status.closed &&
+        workload.has(assignment.technician_link)
+      ) {
+        workload.set(
+          assignment.technician_link,
+          workload.get(assignment.technician_link)! + 1,
+        );
+      }
+    }
+
+    const overdueTasks = await prisma.tasks.findMany({
+      where: {
+        created_at: { lte: eligibleBefore },
+        task_user: {
+          some: { status: status.open, technician_link: null },
+        },
+      },
+      include: {
+        task_user: { orderBy: { id: 'desc' }, take: 1 },
+        equipment: { include: { company: true } },
+      },
+      orderBy: { created_at: 'asc' },
+    });
+
+    for (const task of overdueTasks) {
+      const latest = task.task_user[0];
+      if (!latest || latest.status !== status.open || latest.technician_link != null) {
+        continue;
+      }
+
+      const technician = [...technicians].sort(
+        (a, b) =>
+          (workload.get(a.id) ?? 0) - (workload.get(b.id) ?? 0) || a.id - b.id,
+      )[0];
+      if (!technician) continue;
+
+      const claimed = await prisma.task_user.updateMany({
+        where: { id: latest.id, status: status.open, technician_link: null },
+        data: {
+          technician_link: technician.id,
+          updated_at: new Date(),
+          updated_by: 'Auto-assignment',
+        },
+      });
+      if (claimed.count !== 1) continue;
+
+      workload.set(technician.id, (workload.get(technician.id) ?? 0) + 1);
+      try {
+        await this.onTechnicianAssigned({
+          task,
+          equipment: task.equipment,
+          companyLink: task.equipment?.company_link,
+          companyName: task.equipment?.company?.name ?? 'the company',
+          technicianName: technician.name ?? technician.phone,
+          technicianUserId: technician.id,
+          assignedByName: 'Automatic assignment',
+          selfAssigned: false,
+        });
+      } catch (error) {
+        this.logger.error(
+          `Failed to notify technician for auto-assigned task ${task.id}: ${error?.message || error}`,
+        );
+      }
+      this.logger.log(`Auto-assigned overdue task ${task.id} to technician ${technician.id}`);
     }
   }
 

@@ -20,9 +20,22 @@ export class HoldAlertScheduler implements OnModuleInit {
       }
     });
     this.logger.log('Hold alert scheduler started (every 15 minutes)');
+    schedule.scheduleJob('* * * * *', async () => {
+      try {
+        await this.notificationService.runUnassignedTaskAutoAssignment();
+      } catch (error) {
+        this.logger.error(
+          `Unassigned task auto-assignment failed: ${error?.message || error}`,
+        );
+      }
+    });
+    this.logger.log('Unassigned task auto-assignment scheduler started (every minute; 15-minute task age)');
     setTimeout(() => {
       this.notificationService.runHoldAlerts().catch((error) => {
         this.logger.error(`Initial hold alert job failed: ${error?.message || error}`);
+      });
+      this.notificationService.runUnassignedTaskAutoAssignment().catch((error) => {
+        this.logger.error(`Initial unassigned task auto-assignment failed: ${error?.message || error}`);
       });
     }, 15000);
   }

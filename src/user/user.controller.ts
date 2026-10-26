@@ -68,6 +68,96 @@ export class UserController {
     return await this.userService.changePassword(res, req);
   }
 
+  @Post("setUserActive")
+  async setUserActive(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.setUserActive(res, req);
+  }
+
+  @Post("approveTask")
+  async approveTask(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.approveTask(res, req);
+  }
+
+  @Post("rejectTask")
+  async rejectTask(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.rejectTask(res, req);
+  }
+
+  @Post("acceptTask")
+  async acceptTask(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.acceptTask(res, req);
+  }
+
+  @Post("unassignTask")
+  async unassignTask(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.unassignTask(res, req);
+  }
+
+  @Post("escalateTask")
+  async escalateTask(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.escalateTask(res, req);
+  }
+
+  @Post("deescalateTask")
+  async deescalateTask(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.deescalateTask(res, req);
+  }
+
+  @Post("confirmTask")
+  async confirmTask(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.clientSignatureForReport(res, req);
+  }
+
+  @Post("verifyEquipment")
+  async verifyEquipment(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.verifyEquipment(res, req);
+  }
+
+  @Post("getVerifiedEquipments")
+  async getVerifiedEquipments(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.getVerifiedEquipments(res, req);
+  }
+
+  @Post("getPmSchedules")
+  async getPmSchedules(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.getPmSchedules(res, req);
+  }
+
+  @Post("createPmSchedule")
+  async createPmSchedule(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.createPmSchedule(res, req);
+  }
+
+  @Post("updatePmSchedule")
+  async updatePmSchedule(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.updatePmSchedule(res, req);
+  }
+
+  @Post("deletePmSchedule")
+  async deletePmSchedule(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.deletePmSchedule(res, req);
+  }
+
+  @Post("generatePmTasks")
+  async generatePmTasks(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.generatePmTasks(res, req);
+  }
+
+  @Post("getPmGeneratedTasks")
+  async getPmGeneratedTasks(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.getPmGeneratedTasks(res, req);
+  }
+
+  @Post("getAuditLogs")
+  async getAuditLogs(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.getAuditLogs(res, req);
+  }
+
+  @Post("getMonthlyStats")
+  async getMonthlyStats(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.getMonthlyStats(res, req);
+  }
+
   @Get("getAllCompanies")
   async getAllCompanies(@Res() res: Response, @Req() req: Request) {
     return await this.userService.getAllCompanies(res, req);

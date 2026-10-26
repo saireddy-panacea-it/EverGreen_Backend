@@ -41,6 +41,8 @@ const prisma = new PrismaClient();
 const SENIOR_DESIGNATION = "Senior Service Engineer";
 const JUNIOR_DESIGNATION = "Junior Service Engineer";
 const DESIGNATION_MESSAGE = `designation must be ${SENIOR_DESIGNATION} or ${JUNIOR_DESIGNATION}`;
+const TM_FREQUENCY_MESSAGE =
+  "tm_frequency must be daily, weekly, biweekly, monthly, bi_monthly, tri_monthly, quarterly, semi_annual or annual";
 import nodemailer from "nodemailer";
 import { FirebaseService } from "../firebase/firebase.service"; // Update the import path as necessary
 import { NotificationService, taskPlaceLabel } from "../notification/notification.service";
@@ -1644,6 +1646,12 @@ export class UserService {
       if (installedAt === "invalid") {
         return res.send({ status: HttpStatus.BAD_REQUEST, message: "installed_at must be an ISO date" });
       }
+      const tmFrequency = this.hasBodyValue(req.body.tm_frequency)
+        ? this.normalizeTmFrequency(req.body.tm_frequency)
+        : null;
+      if (this.hasBodyValue(req.body.tm_frequency) && !tmFrequency) {
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: TM_FREQUENCY_MESSAGE });
+      }
 
       if (dbCompany != null) {
         const equipment: equipment = {
@@ -1658,7 +1666,7 @@ export class UserService {
           manufacturer_date: new Date(req.body.manufacturer_date),
           location: req.body.location,
           description: req.body.description,
-          tm_frequency: req.body.tm_frequency,
+          tm_frequency: tmFrequency,
           company_link: companyLink,
           created_at: undefined,
           created_by: "",
@@ -1739,6 +1747,12 @@ export class UserService {
       if (installedAt === "invalid") {
         return res.send({ status: HttpStatus.BAD_REQUEST, message: "installed_at must be an ISO date" });
       }
+      const tmFrequency = this.hasBodyValue(req.body.tm_frequency)
+        ? this.normalizeTmFrequency(req.body.tm_frequency)
+        : dbEquipment.tm_frequency;
+      if (this.hasBodyValue(req.body.tm_frequency) && !tmFrequency) {
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: TM_FREQUENCY_MESSAGE });
+      }
 
       // Update equipment
       const updatedEquipment = await prisma.equipment.update({
@@ -1759,7 +1773,7 @@ export class UserService {
             : dbEquipment.manufacturer_date,
           location: req.body.location ?? dbEquipment.location,
           description: req.body.description ?? dbEquipment.description,
-          tm_frequency: req.body.tm_frequency ?? dbEquipment.tm_frequency,
+          tm_frequency: tmFrequency,
           updated_at: new Date(),
           updated_by: req.user.phone || "",
           manual: req.body.manual || dbEquipment.manual || "",
@@ -4140,6 +4154,10 @@ export class UserService {
 
   async uploadEquipmentData(res, req, file) {
     try {
+      const denied = await this.bulkUploadDenied(req);
+      if (denied) {
+        return res.send({ status: HttpStatus.FORBIDDEN, message: denied });
+      }
       if (!file?.buffer) {
         return res.status(200).send({
           status: HttpStatus.CONFLICT,
@@ -4219,7 +4237,12 @@ export class UserService {
                 (this.excelCellText(record.location) || ""),
               "EG-"
             );
-          const frequency = this.excelCellText(record.tm_frequency) as tm_frequency;
+          const rawFrequency = this.excelCellText(record.tm_frequency);
+          const frequency = rawFrequency ? this.normalizeTmFrequency(rawFrequency) : null;
+          if (rawFrequency && !frequency) {
+            errors.push(`Row ${rowNumber}: ${TM_FREQUENCY_MESSAGE} (got "${rawFrequency}")`);
+            continue;
+          }
           const equipmentData: any = {
             name,
             make,
@@ -4312,6 +4335,10 @@ export class UserService {
 
   async uploadCompanyData(res, req, file) {
     try {
+      const denied = await this.bulkUploadDenied(req);
+      if (denied) {
+        return res.send({ status: HttpStatus.FORBIDDEN, message: denied });
+      }
       const loaded = await this.loadExcelRows(file);
       if (loaded.error) {
         return res.status(200).send({
@@ -4471,6 +4498,10 @@ export class UserService {
 
   async uploadTechnicianData(res, req, file) {
     try {
+      const denied = await this.bulkUploadDenied(req);
+      if (denied) {
+        return res.send({ status: HttpStatus.FORBIDDEN, message: denied });
+      }
       const loaded = await this.loadExcelRows(file);
       if (loaded.error) {
         return res.status(200).send({
@@ -4556,6 +4587,40 @@ export class UserService {
       return JUNIOR_DESIGNATION;
     }
     return null;
+  }
+
+  normalizeTmFrequency(value: unknown): tm_frequency | null {
+    const normalized = String(value ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+    const aliases: Record<string, tm_frequency> = {
+      daily: tm_frequency.daily,
+      weekly: tm_frequency.weekly,
+      biweekly: tm_frequency.biweekly,
+      bi_weekly: tm_frequency.biweekly,
+      fortnightly: tm_frequency.biweekly,
+      monthly: tm_frequency.monthly,
+      bi_monthly: tm_frequency.bi_monthly,
+      bimonthly: tm_frequency.bi_monthly,
+      tri_monthly: tm_frequency.tri_monthly,
+      trimonthly: tm_frequency.tri_monthly,
+      quarterly: tm_frequency.quarterly,
+      semi_annual: tm_frequency.semi_annual,
+      semiannual: tm_frequency.semi_annual,
+      semi_annually: tm_frequency.semi_annual,
+      half_yearly: tm_frequency.semi_annual,
+      halfyearly: tm_frequency.semi_annual,
+      annual: tm_frequency.annual,
+      annually: tm_frequency.annual,
+      yearly: tm_frequency.annual,
+    };
+    return aliases[normalized] ?? null;
+  }
+
+  /** Bulk uploads create companies, equipment and users, so only admins may run them. */
+  private async bulkUploadDenied(req): Promise<string | null> {
+    const actor = await this.findOne(req.user?.phone);
+    return actor?.access_level === access_level.eg_super_admin || actor?.access_level === access_level.eg_admin
+      ? null
+      : "Only admins can bulk upload";
   }
 
   private hasBodyValue(value: unknown): boolean {

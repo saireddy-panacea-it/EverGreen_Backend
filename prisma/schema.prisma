@@ -21,6 +21,10 @@ model user {
   pan_id            String?      @db.VarChar(20)
   aadhaar_id        String?      @db.VarChar(20)
   permanent_address String?      @db.VarChar(500)
+  is_active         Boolean      @default(true)
+  bio               String?
+  date_of_birth     DateTime?
+  avatar_url        String?
 
   created_at    DateTime        @default(now())
   created_by    String?
@@ -29,6 +33,9 @@ model user {
   company_user  company_user[]
   tokens        tokens[]
   notifications notifications[]
+  managed_tasks       tasks[]     @relation("task_manager")
+  verified_equipments equipment[] @relation("equipment_verifier")
+  audit_logs          audit_log[]
 }
 
 model company {
@@ -151,6 +158,54 @@ enum tm_frequency {
   annual
 }
 
+enum task_priority {
+  low
+  medium
+  high
+  critical
+}
+
+enum approval_state {
+  requested
+  approved
+  assigned
+  in_service
+  completed
+  confirmed
+  rejected
+}
+
+enum equipment_status {
+  operational
+  under_maintenance
+  faulty
+  retired
+}
+
+enum pm_frequency {
+  monthly
+  quarterly
+  half_yearly
+  yearly
+}
+
+enum audit_action {
+  created
+  updated
+  deleted
+  logged_in
+  logged_out
+  assigned
+}
+
+enum audit_entity {
+  user
+  task
+  amc
+  equipment
+  auth
+}
+
 model equipment {
   id                Int           @id @default(autoincrement())
   name              String
@@ -173,6 +228,13 @@ model equipment {
   updated_at        DateTime      @default(now())
   updated_by        String?
   is_active         Boolean       @default(true)
+  status            equipment_status @default(operational)
+  type              String?
+  installed_at      DateTime?
+  verified_at       DateTime?
+  verified_by       Int?
+  verifier          user?         @relation("equipment_verifier", fields: [verified_by], references: [id], onDelete: SetNull)
+  pm_schedules      pm_schedule[]
 
   @@unique([eg_serial_number, make, model], name: "equipment_eg_serial_number_make_model")
 }
@@ -204,6 +266,21 @@ model tasks {
   updated_at           DateTime      @default(now())
   updated_by           String?
   hold_reason          hold_reason[]
+  priority             task_priority  @default(medium)
+  approval             approval_state @default(requested)
+  manager_link         Int?
+  manager              user?          @relation("task_manager", fields: [manager_link], references: [id], onDelete: SetNull)
+  due_date             DateTime?
+  escalated            Boolean        @default(false)
+  escalation_reason    String?
+  assigned_at          DateTime?
+  accepted_at          DateTime?
+  started_at           DateTime?
+  resolved_at          DateTime?
+  closed_at            DateTime?
+  resolution_notes     String?
+  rejection_reason     String?
+  pm_generated         pm_generated_task[]
 
   @@unique([equipment_link, name, description, call_type], name: "tasks_equipment_link_name_description_call_type")
 }
@@ -319,4 +396,48 @@ model service_report {
   updated_at                      DateTime  @default(now())
   updated_by                      String?
   company                         company?  @relation(fields: [company_link], references: [id])
+}
+
+model audit_log {
+  id          Int          @id @default(autoincrement())
+  actor_link  Int?
+  actor_name  String
+  actor_role  String
+  action      audit_action
+  entity      audit_entity
+  entity_id   String?
+  entity_name String
+  details     String?
+  created_at  DateTime     @default(now())
+  actor       user?        @relation(fields: [actor_link], references: [id], onDelete: SetNull)
+
+  @@index([created_at])
+  @@index([actor_link])
+}
+
+model pm_schedule {
+  id             Int                 @id @default(autoincrement())
+  equipment_link Int
+  frequency      pm_frequency
+  next_due       DateTime
+  is_active      Boolean             @default(true)
+  created_at     DateTime            @default(now())
+  updated_at     DateTime            @default(now())
+  created_by     String?
+  equipment      equipment           @relation(fields: [equipment_link], references: [id], onDelete: Cascade)
+  generated      pm_generated_task[]
+
+  @@index([equipment_link])
+}
+
+model pm_generated_task {
+  id            Int         @id @default(autoincrement())
+  schedule_link Int
+  task_link     Int?
+  due_date      DateTime
+  generated_at  DateTime    @default(now())
+  schedule      pm_schedule @relation(fields: [schedule_link], references: [id], onDelete: Cascade)
+  task          tasks?      @relation(fields: [task_link], references: [id], onDelete: SetNull)
+
+  @@unique([schedule_link, due_date])
 }

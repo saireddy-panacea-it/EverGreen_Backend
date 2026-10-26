@@ -21,6 +21,30 @@ export const ROLE = {
   CLIENT: access_level.client,
 };
 
+type TaskContact = {
+  contact_name?: string | null;
+  contact_phone?: string | null;
+  address?: string | null;
+} | null | undefined;
+
+/** Where a task is: its company, or for an individual task (no equipment) the contact and address. */
+export function taskPlaceLabel(task: TaskContact, company?: { name?: string | null } | null): string {
+  if (company?.name) return company.name;
+  const parts = [task?.contact_name, task?.address]
+    .map((value) => String(value ?? '').trim())
+    .filter(Boolean);
+  return parts.join(', ') || 'the customer';
+}
+
+/** Email lines naming the company, or the contact for an individual task. */
+export function taskPlaceLines(task: TaskContact, company?: { name?: string | null } | null): string {
+  if (company?.name || !(task?.contact_name || task?.address)) {
+    return `Company: ${company?.name || ''}`;
+  }
+  return `Customer: ${task?.contact_name || ''}${task?.contact_phone ? ` (${task.contact_phone})` : ''}
+Address: ${task?.address || ''}`;
+}
+
 @Injectable()
 export class NotificationService {
   private readonly logger = new Logger(NotificationService.name);
@@ -40,6 +64,9 @@ export class NotificationService {
       id?: number;
       name?: string | null;
       description?: string | null;
+      contact_name?: string | null;
+      contact_phone?: string | null;
+      address?: string | null;
       equipment?: {
         eg_serial_number?: string | null;
         location?: string | null;
@@ -54,7 +81,10 @@ export class NotificationService {
       description: extra.description || task?.description || '',
       serial_number: serial,
       Serial_number: serial,
-      location: task?.equipment?.location || '',
+      location: task?.equipment?.location || task?.address || '',
+      contact_name: task?.contact_name || '',
+      contact_phone: task?.contact_phone || '',
+      address: task?.address || '',
       image_url: extra.image_url || '',
       channel_id: extra.channel_id || 'evergreen_normal',
       action: extra.action || '',
@@ -324,12 +354,12 @@ EverGreen`;
         `High priority task: ${opts.task?.name || opts.task?.id}`,
         `A high priority (breakdown) task was created.
 
-Company: ${opts.companyName}
+${taskPlaceLines(opts.task, opts.equipment ? { name: opts.companyName } : null)}
 Raised by: ${opts.raisedByName}
 Task: ${opts.task?.name || ''}
 Description: ${opts.task?.description || ''}
 Serial: ${opts.equipment?.eg_serial_number || ''}
-Location: ${opts.equipment?.location || ''}
+Location: ${opts.equipment?.location || opts.task?.address || ''}
 
 Please review this task in the EverGreen app.`,
       );
@@ -482,7 +512,7 @@ Please review this task in the EverGreen app.`,
           task,
           equipment: task.equipment,
           companyLink: task.equipment?.company_link,
-          companyName: task.equipment?.company?.name ?? 'the company',
+          companyName: taskPlaceLabel(task, task.equipment?.company),
           technicianName: technician.name ?? technician.phone,
           technicianUserId: technician.id,
           assignedByName: 'Automatic assignment',
@@ -500,7 +530,7 @@ Please review this task in the EverGreen app.`,
   async onTaskStatusUpdated(opts: {
     task: any;
     equipment: any;
-    companyLink: number;
+    companyLink: number | null | undefined;
     companyName: string;
     statusLabel: string;
     updatedByName: string;
@@ -516,13 +546,17 @@ Please review this task in the EverGreen app.`,
       },
     );
 
-    await this.pushToLevels(
-      [ROLE.AMC_MANAGER, ROLE.CLIENT],
-      opts.companyLink,
-      'Task status updated',
-      payload,
-      opts.actorUserId,
-    );
+    // Without a company, client levels would resolve to every client in the system.
+    const hasCompany = opts.companyLink != null;
+    if (hasCompany) {
+      await this.pushToLevels(
+        [ROLE.AMC_MANAGER, ROLE.CLIENT],
+        opts.companyLink,
+        'Task status updated',
+        payload,
+        opts.actorUserId,
+      );
+    }
 
     await this.pushToLevels(
       [ROLE.ADMIN],
@@ -543,7 +577,7 @@ Please review this task in the EverGreen app.`,
       opts.actorUserId,
     );
 
-    if (opts.isCompleted) {
+    if (opts.isCompleted && hasCompany) {
       await this.pushToLevels(
         [ROLE.AMC_MANAGER],
         opts.companyLink,
@@ -729,7 +763,7 @@ This is an automated EverGreen notification.`,
         if (!(await this.alreadyAlerted(row.task_link, title))) {
           await this.pushToLevels([ROLE.ADMIN], undefined, title, {
             ...payload,
-            description: `Task ${row.task?.name || row.task_link} at ${equipment?.company?.name || ''} has been on hold for more than 24 hours.`,
+            description: `Task ${row.task?.name || row.task_link} at ${taskPlaceLabel(row.task, equipment?.company)} has been on hold for more than 24 hours.`,
           });
           await this.emailToLevels(
             [ROLE.ADMIN],
@@ -737,11 +771,11 @@ This is an automated EverGreen notification.`,
             `Task on hold over 24 hours: ${row.task?.name || row.task_link}`,
             `The following task has been on hold for more than 24 hours.
 
-Company: ${equipment?.company?.name || ''}
+${taskPlaceLines(row.task, equipment?.company)}
 Task: ${row.task?.name || ''}
 Description: ${row.task?.description || ''}
 Serial: ${equipment?.eg_serial_number || ''}
-Location: ${equipment?.location || ''}
+Location: ${equipment?.location || row.task?.address || ''}
 
 Please follow up in the EverGreen app.`,
           );

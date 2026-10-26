@@ -857,6 +857,179 @@ describe('UserService bulk uploads and TM frequency', () => {
   });
 });
 
+describe('UserService password storage', () => {
+  let service: UserService;
+  let notifications: Record<string, jest.Mock>;
+  const ExcelJS = require('exceljs');
+  const { isPasswordHash, verifyPassword, hashPassword } = require('../auth/password');
+  const asAdmin = () =>
+    jest.spyOn(service, 'findOne').mockResolvedValue({ id: 1, name: 'Admin', phone: '9000000001', access_level: 'eg_admin', company_user: [] } as any);
+  const expectHashOf = async (stored: string, plain: string) => {
+    expect(isPasswordHash(stored)).toBe(true);
+    expect((await verifyPassword(plain, stored)).ok).toBe(true);
+  };
+  const echoCreate = (id: number) => jest.fn(async ({ data }) => ({ id, ...data }));
+  const sheet = async (header: string[], rows: string[][]) => {
+    const workbook = new ExcelJS.Workbook();
+    const ws = workbook.addWorksheet('Sheet1');
+    ws.addRow(header);
+    rows.forEach((row) => ws.addRow(row));
+    return { buffer: Buffer.from(await workbook.xlsx.writeBuffer()) };
+  };
+
+  beforeEach(async () => {
+    for (const key of Object.keys(mockPrisma)) delete mockPrisma[key];
+    notifications = {
+      sendCredentialsEmail: jest.fn(),
+      onNewTechnician: jest.fn(),
+      onNewAmc: jest.fn(),
+      pushToLevels: jest.fn(),
+    };
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        UserService,
+        { provide: FirebaseService, useValue: {} },
+        { provide: NotificationService, useValue: notifications },
+      ],
+    }).compile();
+    service = module.get<UserService>(UserService);
+  });
+
+  it('createUser stores a hash, emails the typed password and never returns it', async () => {
+    asAdmin();
+    db('user').create = echoCreate(10);
+    const res = mockRes();
+    await service.createUser(res, {
+      user: { phone: '9000000001' },
+      body: { name: 'Suresh', phone: '9876500000', email: 's@example.com', password: 'Tech@123', access_level: 'technician', designation: 'Junior Technician' },
+    });
+    await expectHashOf(db('user').create.mock.calls[0][0].data.password, 'Tech@123');
+    expect(notifications.sendCredentialsEmail.mock.calls[0][0]).toMatchObject({ phone: '9876500000', password: 'Tech@123' });
+    expect(sent(res).status).toBe(200);
+    expect(sent(res).data).not.toHaveProperty('password');
+  });
+
+  it('updateUser hashes a new password and leaves it alone otherwise', async () => {
+    asAdmin();
+    db('user').findFirst.mockResolvedValue({ id: 10, name: 'Suresh', phone: '9876500000', access_level: 'technician', password: 'old-plain' });
+    db('company_user').findMany.mockResolvedValue([]);
+    db('user').update = echoCreate(10);
+    const res = mockRes();
+    await service.updateUser('10', res, { user: { phone: '9000000001' }, body: { password: 'New@1234' } });
+    await expectHashOf(db('user').update.mock.calls[0][0].data.password, 'New@1234');
+    expect(sent(res).data).not.toHaveProperty('password');
+
+    await service.updateUser('10', mockRes(), { user: { phone: '9000000001' }, body: { name: 'Suresh K' } });
+    expect(db('user').update.mock.calls[1][0].data.password).toBeUndefined();
+  });
+
+  it('createCompany hashes the client admin password and emails the typed one', async () => {
+    asAdmin();
+    const tx = {
+      company: { create: echoCreate(3) },
+      user: { create: echoCreate(11) },
+      company_user: { create: jest.fn() },
+    };
+    mockPrisma.$transaction = jest.fn(async (fn) => fn(tx));
+    const res = mockRes();
+    await service.createCompany(res, {
+      user: { phone: '9000000001' },
+      body: {
+        company_name: 'Acme', branch_name: 'HQ', company_location: 'Bengaluru', gst_number: '29ABCDE1234F1Z5',
+        service_type: 'regular', name: 'Kiran', phone: '9876511111', email: 'k@example.com', password: 'Amc@1234',
+      },
+    });
+    expect(sent(res)).toMatchObject({ status: 200, message: 'company created successfully' });
+    await expectHashOf(tx.user.create.mock.calls[0][0].data.password, 'Amc@1234');
+    expect(notifications.sendCredentialsEmail.mock.calls[0][0]).toMatchObject({ phone: '9876511111', password: 'Amc@1234' });
+    expect(JSON.stringify(sent(res))).not.toContain('password');
+  });
+
+  it('updateCompany hashes client admin passwords for both update and create', async () => {
+    const req = { user: { phone: '9000000001' }, body: { name: 'Kiran', phone: '9876511111', email: 'k@example.com', password: 'Amc@5678' } };
+    const admin = { access_level: 'eg_admin', company_user: [] };
+    db('company_user').findFirst.mockResolvedValueOnce({ user_link: 11 }).mockResolvedValueOnce(null);
+    const update = await (service as any).planCompanyClientAdmin(req, 3, admin, 'Bengaluru');
+    expect(update.kind).toBe('update');
+    await expectHashOf(update.data.password, 'Amc@5678');
+    const create = await (service as any).planCompanyClientAdmin(req, 3, admin, 'Bengaluru');
+    expect(create.kind).toBe('create');
+    await expectHashOf(create.data.password, 'Amc@5678');
+  });
+
+  it('register stores a hash', async () => {
+    db('user').create = echoCreate(12);
+    const res = mockRes();
+    await service.register(res, { body: { name: 'New', phone: '9876522222', email: 'n@example.com', password: 'Reg@1234' } });
+    expect(sent(res).status).toBe(200);
+    await expectHashOf(db('user').create.mock.calls[0][0].data.password, 'Reg@1234');
+  });
+
+  it('changePassword verifies legacy and hashed current passwords and stores a hash', async () => {
+    for (const stored of ['Old@1234', await hashPassword('Old@1234')]) {
+      db('user').findUnique.mockResolvedValue({ id: 4, phone: '9876500000', password: stored });
+      db('user').update = jest.fn().mockResolvedValue({});
+      const res = mockRes();
+      await service.changePassword(res, { user: { sub: 4 }, body: { current_password: 'Old@1234', new_password: 'New@1234' } });
+      expect(sent(res)).toEqual({ status: 200, message: 'password updated' });
+      await expectHashOf(db('user').update.mock.calls[0][0].data.password, 'New@1234');
+
+      const wrong = mockRes();
+      await service.changePassword(wrong, { user: { sub: 4 }, body: { current_password: 'old@1234', new_password: 'New@1234' } });
+      expect(sent(wrong)).toEqual({ status: 402, message: 'current password is incorrect' });
+      expect(db('user').update).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('forgetPassword emails a new temporary password and stores only its hash', async () => {
+    jest.spyOn(service, 'findOne').mockResolvedValue({ id: 4, name: 'Ravi', email: 'ravi@example.com', password: 'Current@1' } as any);
+    const sendEmail = jest.spyOn(service, 'sendEmail').mockResolvedValue(true);
+    const res = mockRes();
+    await service.forgetPassword(res, { body: { phone: '9876500000' } });
+    expect(sent(res)).toEqual({ message: 'Password sent to your registered email id: ravi@example.com', status: 200 });
+    const [to, subject, body] = sendEmail.mock.calls[0];
+    expect([to, subject]).toEqual(['ravi@example.com', 'Forgot Password']);
+    expect(body).not.toContain('Current@1');
+    const temporary = body.match(/Your temporary password is: (\S+)/)[1];
+    expect(temporary).toMatch(/^[A-Za-z2-9]{10}$/);
+    const update = db('user').update.mock.calls[0][0];
+    expect(update.where).toEqual({ id: 4 });
+    await expectHashOf(update.data.password, temporary);
+  });
+
+  it('forgetPassword keeps the current password when the email fails', async () => {
+    jest.spyOn(service, 'findOne').mockResolvedValue({ id: 4, name: 'Ravi', email: 'ravi@example.com', password: 'Current@1' } as any);
+    jest.spyOn(service, 'sendEmail').mockResolvedValue(false);
+    const res = mockRes();
+    await service.forgetPassword(res, { body: { phone: '9876500000' } });
+    expect(sent(res)).toEqual({ message: 'Password failed sent to your registered email id: ravi@example.com', status: 402 });
+    expect(db('user').update).not.toHaveBeenCalled();
+  });
+
+  it('uploadTechnicianData stores hashes', async () => {
+    asAdmin();
+    const file = await sheet(['Name', 'Phone', 'Email', 'Password', 'Designation'], [['Suresh', '9876533333', 's2@example.com', 'Tech@999', 'Senior Service Engineer']]);
+    const res = mockRes();
+    await service.uploadTechnicianData(res, { user: { phone: '9000000001' }, body: {} }, file);
+    expect(sent(res)).toMatchObject({ status: 200, added: 1 });
+    await expectHashOf(db('user').create.mock.calls[0][0].data.password, 'Tech@999');
+  });
+
+  it('uploadCompanyData stores hashed admin passwords', async () => {
+    asAdmin();
+    db('user').create = echoCreate(20);
+    db('company').create = echoCreate(5);
+    const file = await sheet(
+      ['Company Name', 'Branch Name', 'Admin Name', 'Admin Phone', 'Admin Email', 'Admin Password', 'Service Type'],
+      [['Acme', 'HQ', 'Kiran', '9876544444', 'k2@example.com', 'Amc@999', 'Regular']],
+    );
+    const res = mockRes();
+    await service.uploadCompanyData(res, { user: { phone: '9000000001' }, body: {} }, file);
+    expect(sent(res)).toMatchObject({ status: 200, added: 1 });
+    await expectHashOf(db('user').create.mock.calls[0][0].data.password, 'Amc@999');
+  });
+});
+
 describe('NotificationService with individual tasks', () => {
   let notifications: NotificationService;
 

@@ -8,6 +8,9 @@ import {
   tm_frequency,
   task_user,
   call_type,
+  company,
+  company_service_type,
+  amc_type,
 } from "@prisma/client";
 import * as crypto from "crypto";
 import puppeteer from "puppeteer";
@@ -318,19 +321,9 @@ export class UserService {
         return res.send({ message: "Please enter a valid GST number", status: HttpStatus.BAD_REQUEST });
       }
 
-      const startDateRaw = String(req.body.start_date ?? "").trim();
-      const endDateRaw = String(req.body.end_date ?? "").trim();
-      const startDate = startDateRaw
-        ? moment.utc(startDateRaw, "YYYY-MM-DD", true).startOf("day")
-        : null;
-      const endDate = endDateRaw
-        ? moment.utc(endDateRaw, "YYYY-MM-DD", true).startOf("day")
-        : null;
-      if (startDate && !startDate.isValid()) {
-        return res.send({ message: "Invalid start date", status: HttpStatus.BAD_REQUEST });
-      }
-      if (endDate && !endDate.isValid()) {
-        return res.send({ message: "Invalid end date", status: HttpStatus.BAD_REQUEST });
+      const serviceTerms = this.resolveCompanyServiceTerms(req.body);
+      if ("error" in serviceTerms) {
+        return res.send({ message: serviceTerms.error, status: HttpStatus.BAD_REQUEST });
       }
 
       const adminName = String(req.body.name ?? "").trim();
@@ -393,8 +386,10 @@ export class UserService {
         name: companyName,
         branch_name: branchName,
         email: req.body.company_email,
-        start_date: startDate?.toDate() ?? null,
-        end_date: endDate?.toDate() ?? null,
+        service_type: serviceTerms.service_type,
+        amc_type: serviceTerms.amc_type,
+        start_date: serviceTerms.start_date,
+        end_date: serviceTerms.end_date,
         location: companyAddress,
         gst_number: gstNumber,
         logo: req.body.logo,
@@ -550,6 +545,19 @@ export class UserService {
         parsedEndDate = endMoment.startOf("day").toDate();
       }
 
+      let serviceType = existingCompany.service_type;
+      let amcType = existingCompany.amc_type;
+      if (this.hasBodyValue(req.body.service_type) || existingCompany.service_type) {
+        const serviceTerms = this.resolveCompanyServiceTerms(req.body, existingCompany);
+        if ("error" in serviceTerms) {
+          return res.send({ message: serviceTerms.error, status: HttpStatus.BAD_REQUEST });
+        }
+        serviceType = serviceTerms.service_type;
+        amcType = serviceTerms.amc_type;
+        parsedStartDate = serviceTerms.start_date;
+        parsedEndDate = serviceTerms.end_date;
+      }
+
       const duplicateCompany = await prisma.company.findFirst({
         where: {
           name: companyName,
@@ -575,8 +583,10 @@ export class UserService {
           ),
           gst_number: gstNumber || existingCompany.gst_number,
           logo: String(req.body.logo ?? existingCompany.logo ?? ""),
-          start_date: parsedStartDate ?? undefined,
-          end_date: parsedEndDate ?? undefined,
+          service_type: serviceType,
+          amc_type: amcType,
+          start_date: serviceType ? parsedStartDate : parsedStartDate ?? undefined,
+          end_date: serviceType ? parsedEndDate : parsedEndDate ?? undefined,
           updated_by: req.user.phone,
         },
       });
@@ -3337,12 +3347,23 @@ export class UserService {
           continue;
         }
 
-        const startDate =
-          this.excelDate(record.start_date) ||
-          moment.utc().startOf("day").toDate();
-        const endDate =
-          this.excelDate(record.end_date) ||
-          moment.utc().add(1, "year").startOf("day").toDate();
+        const rowServiceType = this.excelCellText(record.service_type) || "amc";
+        const rowIsAmc =
+          this.normalizeCompanyServiceType(rowServiceType) === company_service_type.amc;
+        const serviceTerms = this.resolveCompanyServiceTerms({
+          service_type: rowServiceType,
+          amc_type: this.excelCellText(record.amc_type),
+          start_date:
+            this.excelDate(record.start_date) ||
+            (rowIsAmc ? moment.utc().startOf("day").toDate() : undefined),
+          end_date:
+            this.excelDate(record.end_date) ||
+            (rowIsAmc ? moment.utc().add(1, "year").startOf("day").toDate() : undefined),
+        });
+        if ("error" in serviceTerms) {
+          errors.push(`Row ${item.rowNumber}: ${serviceTerms.error}`);
+          continue;
+        }
 
         const dbUser = await prisma.user.create({
           data: {
@@ -3362,8 +3383,10 @@ export class UserService {
             branch_name: branchName,
             email:
               this.excelCellText(record.company_email) || adminEmail,
-            start_date: startDate,
-            end_date: endDate,
+            service_type: serviceTerms.service_type,
+            amc_type: serviceTerms.amc_type,
+            start_date: serviceTerms.start_date,
+            end_date: serviceTerms.end_date,
             location:
               this.excelCellText(record.company_location) ||
               this.excelCellText(record.location) ||
@@ -3481,6 +3504,90 @@ export class UserService {
     if (normalized === "senior service engineer") return "Senior Service Engineer";
     if (normalized === "junior technician") return "Junior Technician";
     return null;
+  }
+
+  private hasBodyValue(value: unknown): boolean {
+    return value != null && String(value).trim() !== "";
+  }
+
+  private normalizeCompanyServiceType(value: unknown): company_service_type | null {
+    const normalized = String(value ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+    if (normalized === "amc") return company_service_type.amc;
+    if (normalized === "non_amc" || normalized === "nonamc") return company_service_type.non_amc;
+    if (normalized === "regular") return company_service_type.regular;
+    return null;
+  }
+
+  private normalizeAmcType(value: unknown): amc_type | null {
+    const normalized = String(value ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+    if (normalized === "c_amc" || normalized === "camc") return amc_type.c_amc;
+    if (normalized === "nc_amc" || normalized === "ncamc") return amc_type.nc_amc;
+    return null;
+  }
+
+  private parseCompanyDate(value: unknown): Date | null | "invalid" {
+    if (value instanceof Date) return isNaN(value.getTime()) ? "invalid" : value;
+    if (!this.hasBodyValue(value)) return null;
+    const parsed = moment.utc(String(value).trim(), "YYYY-MM-DD", true);
+    return parsed.isValid() ? parsed.startOf("day").toDate() : "invalid";
+  }
+
+  /**
+   * Only AMC companies carry an AMC type and contract dates; Non-AMC and
+   * Regular companies always store them as null. Missing fields fall back to
+   * `existing` so partial updates keep the saved values.
+   */
+  private resolveCompanyServiceTerms(
+    body: Record<string, unknown>,
+    existing?: company | null
+  ):
+    | { error: string }
+    | {
+        service_type: company_service_type;
+        amc_type: amc_type | null;
+        start_date: Date | null;
+        end_date: Date | null;
+      } {
+    const serviceType = this.hasBodyValue(body.service_type)
+      ? this.normalizeCompanyServiceType(body.service_type)
+      : existing?.service_type ?? null;
+    if (!serviceType) {
+      return {
+        error: this.hasBodyValue(body.service_type)
+          ? "Service type must be AMC, Non-AMC or Regular"
+          : "Please select a service type",
+      };
+    }
+    if (serviceType !== company_service_type.amc) {
+      return { service_type: serviceType, amc_type: null, start_date: null, end_date: null };
+    }
+
+    const amcType = this.hasBodyValue(body.amc_type)
+      ? this.normalizeAmcType(body.amc_type)
+      : existing?.amc_type ?? null;
+    if (!amcType) {
+      return {
+        error: this.hasBodyValue(body.amc_type)
+          ? "AMC type must be C AMC or NC AMC"
+          : "Please select an AMC type (C AMC or NC AMC)",
+      };
+    }
+
+    const startDate = this.hasBodyValue(body.start_date)
+      ? this.parseCompanyDate(body.start_date)
+      : existing?.start_date ?? null;
+    const endDate = this.hasBodyValue(body.end_date)
+      ? this.parseCompanyDate(body.end_date)
+      : existing?.end_date ?? null;
+    if (startDate === "invalid") return { error: "Invalid start date" };
+    if (endDate === "invalid") return { error: "Invalid end date" };
+    if (!startDate || !endDate) {
+      return { error: "Start date and end date are required for AMC" };
+    }
+    if (endDate < startDate) {
+      return { error: "End date must be on or after start date" };
+    }
+    return { service_type: serviceType, amc_type: amcType, start_date: startDate, end_date: endDate };
   }
 
   private uploadSummary(

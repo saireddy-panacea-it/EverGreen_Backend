@@ -1,7 +1,15 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { PrismaClient, access_level, status } from '@prisma/client';
+import {
+  PrismaClient,
+  access_level,
+  approval_state,
+  audit_action,
+  audit_entity,
+  status,
+} from '@prisma/client';
 import * as nodemailer from 'nodemailer';
 import { FirebaseService } from '../firebase/firebase.service';
+import { writeAuditLog } from '../audit/audit-log';
 
 const prisma = new PrismaClient();
 
@@ -79,14 +87,14 @@ export class NotificationService {
 
     if (globalLevels.length) {
       const globalUsers = await prisma.user.findMany({
-        where: { access_level: { in: globalLevels } },
+        where: { access_level: { in: globalLevels }, is_active: true },
         select: { id: true, email: true },
       });
       users.push(...globalUsers);
     }
 
     if (companyLevels.length) {
-      const where: any = { access_level: { in: companyLevels } };
+      const where: any = { access_level: { in: companyLevels }, is_active: true };
       if (companyLink != null) {
         where.company_user = { some: { company_link: companyLink } };
       }
@@ -381,7 +389,7 @@ Please review this task in the EverGreen app.`,
   async runUnassignedTaskAutoAssignment() {
     const eligibleBefore = new Date(Date.now() - 15 * 60 * 1000);
     const technicians = await prisma.user.findMany({
-      where: { access_level: ROLE.TECHNICIAN },
+      where: { access_level: ROLE.TECHNICIAN, is_active: true },
       select: { id: true, name: true, phone: true },
       orderBy: { id: 'asc' },
     });
@@ -449,6 +457,24 @@ Please review this task in the EverGreen app.`,
         },
       });
       if (claimed.count !== 1) continue;
+
+      try {
+        await prisma.tasks.update({
+          where: { id: task.id },
+          data: { assigned_at: new Date(), accepted_at: null, approval: approval_state.assigned },
+        });
+      } catch (error) {
+        this.logger.error(`Failed to stamp auto-assigned task ${task.id}: ${error?.message || error}`);
+      }
+      await writeAuditLog(prisma, {
+        actorName: 'Automatic assignment',
+        actorRole: 'system',
+        action: audit_action.assigned,
+        entity: audit_entity.task,
+        entityId: task.id,
+        entityName: task.ticket_no,
+        details: `technician_link=${technician.id}`,
+      });
 
       workload.set(technician.id, (workload.get(technician.id) ?? 0) + 1);
       try {

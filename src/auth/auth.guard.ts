@@ -9,12 +9,14 @@ import { Request } from "express";
 import { Reflector } from "@nestjs/core";
 import { IS_API_KEY, IS_API_KEY_FROM_QUERY } from "./api_key_auth.decorator";
 import { IS_PUBLIC_KEY } from "./public.decorator";
+import { UserService } from "../user/user.service";
 
 @Injectable()
 export class AuthGuard implements CanActivate {
   constructor(
     private jwtService: JwtService,
-    private reflector: Reflector
+    private reflector: Reflector,
+    private userService: UserService
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -62,6 +64,10 @@ export class AuthGuard implements CanActivate {
       request["user"] = payload;
     } catch {
       throw new UnauthorizedException();
+    }
+    // Tokens outlive deactivation (60 days), so inactive accounts are refused per request.
+    if (await this.userService.isDeactivated(request["user"]?.sub)) {
+      throw new UnauthorizedException("Your account is inactive. Contact your administrator.");
     }
     return true;
   }

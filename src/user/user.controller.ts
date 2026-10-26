@@ -58,6 +58,11 @@ export class UserController {
     return await this.userService.deleteCompany(res, req);
   }
 
+  @Post("setCompanyActive")
+  async setCompanyActive(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.setCompanyActive(res, req);
+  }
+
   @Get("getAllCompanies")
   async getAllCompanies(@Res() res: Response, @Req() req: Request) {
     return await this.userService.getAllCompanies(res, req);

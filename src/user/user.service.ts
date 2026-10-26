@@ -605,6 +605,22 @@ export class UserService {
   }
 
   async deleteCompany(res, req) {
+    const action = String(req.body.action ?? "").trim().toLowerCase();
+    return this.toggleCompanyActive(res, req, action === "activate");
+  }
+
+  async setCompanyActive(res, req) {
+    const raw = req.body.is_active;
+    if (typeof raw !== "boolean" && raw !== "true" && raw !== "false") {
+      return res.send({
+        message: "is_active must be true or false",
+        status: HttpStatus.BAD_REQUEST,
+      });
+    }
+    return this.toggleCompanyActive(res, req, raw === true || raw === "true");
+  }
+
+  private async toggleCompanyActive(res, req, isActive: boolean) {
     try {
       const companyId = parseInt(String(req.body.company_link ?? ""), 10);
       if (isNaN(companyId)) {
@@ -637,107 +653,30 @@ export class UserService {
         const isCreator = existingCompany.created_by === req.user.phone;
         if (!isLinked && !isCreator) {
           return res.status(HttpStatus.FORBIDDEN).send({
-            message: "You do not have access to delete this company",
+            message: "You do not have access to change this company",
             status: HttpStatus.FORBIDDEN,
           });
         }
       }
 
-      const companyEquipments = await prisma.equipment.findMany({
-        where: { company_link: companyId },
-        select: { id: true },
-      });
-      const equipmentIds = companyEquipments.map((x) => x.id);
-
-      const linkedTasks = equipmentIds.length
-        ? await prisma.tasks.findMany({
-            where: {
-              equipment_link: { in: equipmentIds },
-            },
-            select: { id: true },
-          })
-        : [];
-      const taskIds = linkedTasks.map((x) => x.id);
-
-      const linkedCompanyUsers = await prisma.company_user.findMany({
-        where: { company_link: companyId },
-        select: { user_link: true },
-      });
-      const linkedUserIds = linkedCompanyUsers.map((x) => x.user_link);
-
-      await prisma.$transaction(async (tx) => {
-        if (taskIds.length > 0) {
-          await tx.images.deleteMany({
-            where: { taskId: { in: taskIds } },
-          });
-          await tx.hold_reason.deleteMany({
-            where: { task_link: { in: taskIds } },
-          });
-          await tx.task_user.deleteMany({
-            where: { task_link: { in: taskIds } },
-          });
-          await tx.notifications.deleteMany({
-            where: { task_link: { in: taskIds } },
-          });
-          await tx.tasks.deleteMany({
-            where: { id: { in: taskIds } },
-          });
-        }
-
-        if (linkedUserIds.length > 0) {
-          await tx.notifications.deleteMany({
-            where: { user_link: { in: linkedUserIds } },
-          });
-          await tx.tokens.deleteMany({
-            where: { user_link: { in: linkedUserIds } },
-          });
-        }
-
-        if (equipmentIds.length > 0) {
-          await tx.equipment.deleteMany({
-            where: { id: { in: equipmentIds } },
-          });
-        }
-
-        await tx.company.updateMany({
-          where: { parent_company_link: companyId },
-          data: { parent_company_link: null },
-        });
-
-        await tx.company_user.deleteMany({
-          where: { company_link: companyId },
-        });
-
-        if (linkedUserIds.length > 0) {
-          const orphanClientAdmins = await tx.user.findMany({
-            where: {
-              id: { in: linkedUserIds },
-              access_level: access_level.client_admin,
-              company_user: { none: {} },
-            },
-            select: { id: true },
-          });
-          const orphanUserIds = orphanClientAdmins.map((user) => user.id);
-          if (orphanUserIds.length > 0) {
-            await tx.user.deleteMany({
-              where: { id: { in: orphanUserIds } },
-            });
-          }
-        }
-
-        await tx.company.delete({
-          where: { id: companyId },
-        });
+      const company = await prisma.company.update({
+        where: { id: companyId },
+        data: {
+          is_active: isActive,
+          updated_at: new Date(),
+          updated_by: req.user.phone,
+        },
       });
 
       return res.status(200).send({
         status: 200,
-        message: "company deleted successfully",
+        message: isActive ? "company activated" : "company deactivated",
+        data: company,
       });
     } catch (error) {
-      console.error("deleteCompany failed", error);
+      console.error("toggleCompanyActive failed", error);
       return res.status(HttpStatus.INTERNAL_SERVER_ERROR).send({
-        message: "Unable to delete company. Please try again.",
+        message: "Unable to update company status. Please try again.",
         status: HttpStatus.INTERNAL_SERVER_ERROR,
       });
     }

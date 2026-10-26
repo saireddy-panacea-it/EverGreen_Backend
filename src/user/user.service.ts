@@ -43,7 +43,7 @@ const JUNIOR_DESIGNATION = "Junior Service Engineer";
 const DESIGNATION_MESSAGE = `designation must be ${SENIOR_DESIGNATION} or ${JUNIOR_DESIGNATION}`;
 import nodemailer from "nodemailer";
 import { FirebaseService } from "../firebase/firebase.service"; // Update the import path as necessary
-import { NotificationService } from "../notification/notification.service";
+import { NotificationService, taskPlaceLabel } from "../notification/notification.service";
 import serviceReportTemplate from "../service_report/service_report"; // billInvoice
 import * as ejs from "ejs";
 import axios from "axios";
@@ -1445,6 +1445,64 @@ export class UserService {
     return { scope: "none" };
   }
 
+  /** An individual task has no equipment, hence no company; it carries contact_name / contact_phone / address. */
+  isIndividualTask(task: { equipment_link?: number | null } | null | undefined): boolean {
+    return task != null && task.equipment_link == null;
+  }
+
+  individualTaskCreateDenied(level: access_level | string | null | undefined): string | null {
+    return level === access_level.eg_super_admin || level === access_level.eg_admin
+      ? null
+      : "Only admins can create individual tasks";
+  }
+
+  /**
+   * Contact block of an individual task. Values missing from `body` fall back to `existing`;
+   * every field must end up non-empty and the phone must be 10-15 digits with an optional leading +.
+   */
+  individualTaskContact(
+    body: Record<string, unknown>,
+    existing?: { name?: string | null; contact_name?: string | null; contact_phone?: string | null; address?: string | null } | null,
+  ):
+    | { error: string }
+    | { name: string; contact_name: string; contact_phone: string; address: string } {
+    const pick = (key: "name" | "contact_name" | "contact_phone" | "address") =>
+      String((body?.[key] !== undefined && body?.[key] !== null ? body[key] : existing?.[key]) ?? "").trim();
+    const values = {
+      name: pick("name"),
+      contact_name: pick("contact_name"),
+      contact_phone: pick("contact_phone").replace(/[\s-]/g, ""),
+      address: pick("address"),
+    };
+    const missing = (Object.keys(values) as Array<keyof typeof values>).filter((key) => !values[key]);
+    if (missing.length) {
+      return {
+        error: `${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} required for an individual task`,
+      };
+    }
+    if (!/^\+?\d{10,15}$/.test(values.contact_phone)) {
+      return { error: "contact_phone must be 10 to 15 digits with an optional leading +" };
+    }
+    return values;
+  }
+
+  /** Task list visibility; tasks without a company (individual tasks) never match a client's companies. */
+  taskListVisible(
+    viewer: { id: number; access_level: access_level | string; designation?: string | null },
+    taskUser: { technician_link?: number | null; task?: { equipment?: { company_link?: number | null } | null } | null },
+    companyLinks: number[],
+  ): boolean {
+    if (this.isSeniorTechnician(viewer.access_level, viewer.designation)) return true;
+    if (viewer.access_level === access_level.technician) {
+      return taskUser.technician_link != null && taskUser.technician_link == viewer.id;
+    }
+    if (viewer.access_level === access_level.client || viewer.access_level === access_level.client_admin) {
+      const companyLink = taskUser.task?.equipment?.company_link;
+      return companyLink != null && companyLinks.includes(companyLink);
+    }
+    return true;
+  }
+
   /** Who may see a ticket: triage roles all, technicians their assignment, client side their companies. */
   canSeeTask(
     actor: { id: number; access_level: access_level | string; designation?: string | null; companyIds: number[] } | null,
@@ -1835,6 +1893,10 @@ export class UserService {
           });
         }
       }
+      const contact = this.taskContactUpdate(req.body, dbTask);
+      if ("error" in contact) {
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: contact.error });
+      }
       const updated = await prisma.tasks.update({
         where: { id: taskId },
         data: {
@@ -1842,6 +1904,7 @@ export class UserService {
           description: req.body.description ?? dbTask.description,
           call_type: req.body.call_type ?? dbTask.call_type,
           equipment_link: req.body.equipment_link ?? dbTask.equipment_link,
+          ...contact.data,
           ...triage.data,
           updated_at: new Date(),
           updated_by: req.user?.phone || "",
@@ -1860,6 +1923,44 @@ export class UserService {
         error: error.message,
       });
     }
+  }
+
+  /**
+   * contact_name / contact_phone / address on an update body. A task that stays individual (no
+   * equipment after the update) must keep all of them and its name non-empty; other tasks may
+   * set or clear them, but a non-empty phone is still validated.
+   */
+  taskContactUpdate(
+    body: Record<string, unknown>,
+    current: { name?: string | null; equipment_link?: number | null; contact_name?: string | null; contact_phone?: string | null; address?: string | null },
+  ): { error: string } | { data: { contact_name?: string | null; contact_phone?: string | null; address?: string | null } } {
+    const keys = ["contact_name", "contact_phone", "address"] as const;
+    const touched = keys.some((key) => body?.[key] !== undefined);
+    const staysIndividual = (body?.equipment_link ?? current.equipment_link) == null;
+    if (staysIndividual && body?.name !== undefined && body?.name !== null && !String(body.name).trim()) {
+      return { error: "name is required for an individual task" };
+    }
+    if (!touched) return { data: {} };
+    if (staysIndividual) {
+      const parsed = this.individualTaskContact(body, current);
+      if ("error" in parsed) return parsed;
+      return {
+        data: { contact_name: parsed.contact_name, contact_phone: parsed.contact_phone, address: parsed.address },
+      };
+    }
+    const data: { contact_name?: string | null; contact_phone?: string | null; address?: string | null } = {};
+    for (const key of keys) {
+      if (body?.[key] === undefined) continue;
+      const value = String(body[key] ?? "").trim();
+      data[key] = value || null;
+    }
+    if (data.contact_phone) {
+      data.contact_phone = data.contact_phone.replace(/[\s-]/g, "");
+      if (!/^\+?\d{10,15}$/.test(data.contact_phone)) {
+        return { error: "contact_phone must be 10 to 15 digits with an optional leading +" };
+      }
+    }
+    return { data };
   }
 
   /** Optional priority / due_date / manager_link on a task body; `changed` is true only when a value differs. */
@@ -2059,24 +2160,41 @@ export class UserService {
   async createTask(res, req) {
     const equipmentLink = req.body.equipment_link;
     const userPhone = req.user.phone;
-    const dbEquipment = await prisma.equipment.findUnique({
-      where: {
-        id: equipmentLink,
-      },
-      include: {
-        company: true,
-      },
-    });
-
-    if (dbEquipment == null) {
-      return res.send({
-        status: 204,
-        message: `Equipment with ID ${equipmentLink} is not present in the database`,
+    const individual = equipmentLink == null || equipmentLink === "";
+    let dbEquipment = null;
+    let raiser = null;
+    let contact: { name: string; contact_name: string; contact_phone: string; address: string } | null = null;
+    if (individual) {
+      raiser = await this.findOne(userPhone);
+      const denied = this.individualTaskCreateDenied(raiser?.access_level);
+      if (denied) {
+        return res.send({ status: HttpStatus.FORBIDDEN, message: denied });
+      }
+      const parsed = this.individualTaskContact(req.body ?? {});
+      if ("error" in parsed) {
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: parsed.error });
+      }
+      contact = parsed;
+    } else {
+      dbEquipment = await prisma.equipment.findUnique({
+        where: {
+          id: equipmentLink,
+        },
+        include: {
+          company: true,
+        },
       });
+
+      if (dbEquipment == null) {
+        return res.send({
+          status: 204,
+          message: `Equipment with ID ${equipmentLink} is not present in the database`,
+        });
+      }
+      raiser = await this.findOne(userPhone);
     }
 
     const callType = mapCallTypeToEnum(req.body?.call_type);
-    const raiser = await this.findOne(userPhone);
     let priority: task_priority = callType === call_type.breakdown ? task_priority.high : task_priority.medium;
     if (this.hasBodyValue(req.body?.priority)) {
       priority = this.normalizePriority(req.body.priority);
@@ -2088,13 +2206,17 @@ export class UserService {
     if (dueDate === "invalid") {
       return res.send({ status: HttpStatus.BAD_REQUEST, message: "due_date must be an ISO date" });
     }
+    const taskName = contact ? contact.name : req.body.name;
     const task = {
-      name: req.body.name,
+      name: taskName,
       description: req.body.description,
       image: { create: this.createImages(req.body.images ?? []) },
-      equipment_link: equipmentLink,
+      equipment_link: individual ? null : equipmentLink,
+      ...(contact
+        ? { contact_name: contact.contact_name, contact_phone: contact.contact_phone, address: contact.address }
+        : {}),
       ticket_no: getAccountFromCompany(
-        req.body.name + req.body.description + (callType ?? undefined)
+        taskName + req.body.description + (callType ?? undefined)
       ),
       call_type: callType ?? undefined,
       otp: this.generateOtp(),
@@ -2114,6 +2236,7 @@ export class UserService {
         name: task.name,
         description: task.description,
         call_type: callType ?? undefined,
+        ...(contact ? { contact_phone: contact.contact_phone } : {}),
       },
     });
 
@@ -2121,7 +2244,9 @@ export class UserService {
       return res.send({
         status: HttpStatus.CONFLICT,
         data: existingTask,
-        message: `task already exist with same name, description, equipment and call_type combo`,
+        message: contact
+          ? `task already exist with same name, description, contact_phone and call_type combo`
+          : `task already exist with same name, description, equipment and call_type combo`,
       });
     }
 
@@ -2132,7 +2257,8 @@ export class UserService {
     if (dbTask != null) {
       await prisma.task_user.create({
         data: {
-          client_link: req.body.client_link,
+          // Individual tasks have no client; the raising admin owns the row so no client can reach it.
+          client_link: individual ? raiser.id : req.body.client_link,
           task_link: dbTask.id,
           status: status.open,
           created_by: userPhone,
@@ -2146,8 +2272,8 @@ export class UserService {
           task: dbTask,
           equipment: dbEquipment,
           raisedByName: user?.name ?? user?.phone,
-          companyName: dbEquipment.company?.name,
-          companyLink: dbEquipment.company_link,
+          companyName: taskPlaceLabel(dbTask, dbEquipment?.company),
+          companyLink: dbEquipment?.company_link,
           isHighPriority: dbTask.call_type === call_type.breakdown,
           actorUserId: user?.id,
         });
@@ -2407,7 +2533,7 @@ export class UserService {
             task: assignedTask,
             equipment: assignedTask?.equipment,
             companyLink: assignedTask?.equipment?.company_link,
-            companyName: assignedTask?.equipment?.company?.name,
+            companyName: taskPlaceLabel(assignedTask, assignedTask?.equipment?.company),
             technicianName: technician?.name ?? technician?.phone,
             technicianUserId: req.body.technician_link,
             assignedByUserId: actor?.id,
@@ -2590,9 +2716,9 @@ export class UserService {
       try {
         await this.notificationService.onTaskStatusUpdated({
           task: dbTask,
-          equipment: dbTaskUser.task.equipment,
-          companyLink: dbTaskUser.task.equipment.company_link,
-          companyName: dbTaskUser.task.equipment.company?.name,
+          equipment: dbTaskUser.task?.equipment,
+          companyLink: dbTaskUser.task?.equipment?.company_link,
+          companyName: taskPlaceLabel(dbTaskUser.task, dbTaskUser.task?.equipment?.company),
           statusLabel: String(taskStatus),
           updatedByName: userInfo?.name ?? userInfo?.phone,
           actorUserId: userInfo?.id,
@@ -2729,17 +2855,24 @@ export class UserService {
 
   async getHoldReasons(res, req) {
     const companyLink = req.body.company_link;
+    const requester = companyLink == null ? await this.findOne(req.user?.phone) : null;
+    // The equipment relation filter drops individual tasks, so admins and service engineers skip it when unfiltered.
+    const unscoped =
+      companyLink == null &&
+      (this.adminOrNot(requester?.access_level) || this.isTechnicianRole(requester?.access_level));
 
     const dbHoldReasons = await prisma.hold_reason.findMany({
-      where: {
-        task: {
-          equipment: {
-            company_link: {
-              in: companyLink ?? undefined,
+      where: unscoped
+        ? undefined
+        : {
+            task: {
+              equipment: {
+                company_link: {
+                  in: companyLink ?? undefined,
+                },
+              },
             },
           },
-        },
-      },
     });
 
     return res.send({
@@ -3014,11 +3147,14 @@ export class UserService {
     if (!task) {
       return { error: { status: 404, message: "Task not found" } };
     }
-    if (!task.ticket_no || !task.equipment?.name || !task.equipment?.company?.name) {
+    const individual = this.isIndividualTask(task);
+    if (individual ? !task.ticket_no || !task.contact_name : !task.ticket_no || !task.equipment?.name || !task.equipment?.company?.name) {
       return {
         error: {
           status: 422,
-          message: "A report requires a ticket number, company, and equipment on the task",
+          message: individual
+            ? "A report requires a ticket number and contact name on the task"
+            : "A report requires a ticket number, company, and equipment on the task",
         },
       };
     }
@@ -3152,19 +3288,23 @@ export class UserService {
       call_type: task.call_type ? String(task.call_type).replace(/_/g, " ").toUpperCase() : "-",
       task_name: task.name,
       task_description: task.description,
-      company: {
-        name: task.equipment?.company?.name,
-        branch: task.equipment?.company?.branch_name,
-        location: task.equipment?.company?.location || formattedCompanyAddress,
-        address: formattedCompanyAddress,
-        gst_number: task.equipment?.company?.gst_number,
-        email: task.equipment?.company?.email,
-      },
-      contact: {
-        name: client?.name,
-        phone: client?.phone,
-        email: client?.email,
-      },
+      company: individual
+        ? { name: task.contact_name, branch: null, location: task.address, address: task.address, gst_number: null, email: null }
+        : {
+            name: task.equipment?.company?.name,
+            branch: task.equipment?.company?.branch_name,
+            location: task.equipment?.company?.location || formattedCompanyAddress,
+            address: formattedCompanyAddress,
+            gst_number: task.equipment?.company?.gst_number,
+            email: task.equipment?.company?.email,
+          },
+      contact: individual
+        ? { name: task.contact_name, phone: task.contact_phone, email: null }
+        : {
+            name: client?.name,
+            phone: client?.phone,
+            email: client?.email,
+          },
       technician: {
         name: technician?.name,
         phone: technician?.phone,
@@ -3286,32 +3426,33 @@ export class UserService {
       },
     });
 
-    const clientInfo = await prisma.user.findUnique({
-      where: {
-        id: task.task_user[0].client_link,
-      },
-    });
+    const clientLink = task?.task_user?.[0]?.client_link;
+    const clientInfo = clientLink != null
+      ? await prisma.user.findUnique({ where: { id: clientLink } })
+      : null;
 
     const outImagesArray = JSON.parse(task?.out_images || "[]");
     // if (task.task_user[0].status == status.closed) {
     const data = {
       bill_to: {
-        name: task.equipment.company.name,
-        location: task.equipment.company.location,
+        name: task?.equipment?.company?.name ?? task?.contact_name,
+        location: task?.equipment?.company?.location ?? task?.address,
       },
       contact_info: {
-        contact_person: clientInfo.name,
-        contact_phone: clientInfo.phone,
+        contact_person: task?.equipment ? clientInfo?.name : task?.contact_name,
+        contact_phone: task?.equipment ? clientInfo?.phone : task?.contact_phone,
       },
       equipment_details: {
         service_report: "12309",
-        date: moment(task.equipment.manufacturer_date).format("yyyy-MM-DD"),
-        name: task.equipment.name,
-        location: task.equipment.location,
-        model_no: task.equipment.model,
-        serial_no: task.equipment.serial_number,
-        voltage: task.equipment.make,
-        call_type: task.call_type.toLocaleUpperCase(),
+        date: task?.equipment?.manufacturer_date
+          ? moment(task.equipment.manufacturer_date).format("yyyy-MM-DD")
+          : undefined,
+        name: task?.equipment?.name,
+        location: task?.equipment?.location ?? task?.address,
+        model_no: task?.equipment?.model,
+        serial_no: task?.equipment?.serial_number,
+        voltage: task?.equipment?.make,
+        call_type: task?.call_type?.toLocaleUpperCase(),
       },
       action_taken: task.action_taken,
       requirement: task.req_details,
@@ -3438,22 +3579,11 @@ export class UserService {
         return false;
       }
       const actorId = parseInt(String(userInfo?.id ?? user.sub ?? ""), 10);
-      const myTask = task.technician_link == actorId;
-      const isCompanyLinked = companyLinks.includes(
-        task.task.equipment.company_link
+      return this.taskListVisible(
+        { id: actorId, access_level: userInfo.access_level, designation: userInfo.designation },
+        task,
+        companyLinks,
       );
-      if (this.isSeniorTechnician(userInfo.access_level, userInfo.designation)) {
-        return true;
-      } else if (userInfo.access_level == access_level.technician) {
-        return myTask;
-      } else if (
-        userInfo.access_level == access_level.client ||
-        userInfo.access_level == access_level.client_admin
-      ) {
-        return isCompanyLinked;
-      } else {
-        return true;
-      }
     });
     const tasksWithImages = filteredTasks.map((taskUser: any) => {
       const task = taskUser.task;
@@ -3690,10 +3820,12 @@ export class UserService {
           where: { task_link: taskLink },
           orderBy: { id: "desc" },
         });
-        const equipment = await prisma.equipment.findUnique({
-          where: { id: task.equipment_link },
-          include: { company: true },
-        });
+        const equipment = task.equipment_link == null
+          ? null
+          : await prisma.equipment.findUnique({
+              where: { id: task.equipment_link },
+              include: { company: true },
+            });
         const hasNotes = Boolean(
           req.body.action_taken ||
             req.body.req_details ||

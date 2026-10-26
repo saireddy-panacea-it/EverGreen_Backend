@@ -222,15 +222,26 @@ export class ServiceReportService {
       return { error: { status: 404, message: "The linked task or ticket was not found" } };
     }
     const company = task.equipment?.company;
-    if (!company?.name || !task.equipment?.name || !task.ticket_no) {
+    const individual = task.equipment_link == null;
+    if (individual ? !task.contact_name || !task.ticket_no : !company?.name || !task.equipment?.name || !task.ticket_no) {
       return {
         error: {
           status: 422,
-          message: "The linked task needs a ticket number, company, and equipment before a report can be generated",
+          message: individual
+            ? "The linked individual task needs a ticket number and contact name before a report can be generated"
+            : "The linked task needs a ticket number, company, and equipment before a report can be generated",
         },
       };
     }
-    if (data.company_link != null && data.company_link !== company.id) {
+    if (individual && data.company_link != null) {
+      return {
+        error: {
+          status: 400,
+          message: "The linked task is an individual task and has no company",
+        },
+      };
+    }
+    if (!individual && data.company_link != null && data.company_link !== company.id) {
       return {
         error: {
           status: 400,
@@ -281,32 +292,46 @@ export class ServiceReportService {
         description: row.reason || (assignedTech ? `Assigned to ${assignedTech.name || assignedTech.phone}` : ""),
       };
     });
-    const address = company.address
+    const address = company?.address
       ? [company.address.address_line, company.address.locality, company.address.city,
           company.address.district, company.address.state, company.address.pincode,
           company.address.country].filter(Boolean).join(", ")
       : "";
+    const place = individual
+      ? {
+          company_link: null,
+          company_name: task.contact_name,
+          company_branch: data.company_branch ?? null,
+          location: task.address || data.location,
+          company_email: data.company_email ?? null,
+          raised_by_name: task.contact_name,
+          raised_by_phone: task.contact_phone || data.raised_by_phone,
+          raised_by_email: data.raised_by_email,
+        }
+      : {
+          company_link: company.id,
+          company_name: company.name,
+          company_branch: company.branch_name,
+          location: company.location || address || data.location,
+          company_email: company.email,
+          raised_by_name: client?.name || data.raised_by_name,
+          raised_by_phone: client?.phone || data.raised_by_phone,
+          raised_by_email: client?.email || data.raised_by_email,
+        };
     return {
       data: {
         ...data,
         task_id: task.ticket_no,
-        company_link: company.id,
-        company_name: company.name,
-        company_branch: company.branch_name,
-        location: company.location || address || data.location,
-        company_email: company.email,
-        raised_by_name: client?.name || data.raised_by_name,
-        raised_by_phone: client?.phone || data.raised_by_phone,
-        raised_by_email: client?.email || data.raised_by_email,
+        ...place,
         technician_name: technician?.name || data.technician_name,
         technician_phone: technician?.phone || data.technician_phone,
         technician_note: technician ? "Assigned service engineer" : "Not assigned yet",
-        equipment_name: task.equipment.name,
-        equipment_make: task.equipment.make,
-        equipment_model: task.equipment.model,
-        equipment_serial_number: task.equipment.serial_number,
-        equipment_eg_serial_number: task.equipment.eg_serial_number,
-        equipment_location: task.equipment.location,
+        equipment_name: individual ? data.equipment_name ?? null : task.equipment.name,
+        equipment_make: individual ? data.equipment_make ?? null : task.equipment.make,
+        equipment_model: individual ? data.equipment_model ?? null : task.equipment.model,
+        equipment_serial_number: individual ? data.equipment_serial_number ?? null : task.equipment.serial_number,
+        equipment_eg_serial_number: individual ? data.equipment_eg_serial_number ?? null : task.equipment.eg_serial_number,
+        equipment_location: individual ? data.equipment_location ?? null : task.equipment.location,
         call_type: task.call_type ? String(task.call_type).replace(/_/g, " ").toUpperCase() : data.call_type,
         issue: task.name || data.issue,
         issue_description: task.description || data.issue_description,
@@ -785,26 +810,30 @@ export class ServiceReportService {
           description: row.reason || (tech ? `${tech.name || "Service engineer"} was assigned to this task.` : ""),
         });
       }
+      const individual = task.equipment_link == null;
       return res.status(200).send({
         status: 200,
         message: "Service report draft loaded from task",
         data: {
           task_id: task.ticket_no || String(task.id),
           company_link: task.equipment?.company_link || null,
-          company_name: task.equipment?.company?.name || "",
+          company_name: task.equipment?.company?.name || (individual ? task.contact_name || "" : ""),
           company_branch: task.equipment?.company?.branch_name || "",
-          location: task.equipment?.company?.location || "",
+          location: task.equipment?.company?.location || (individual ? task.address || "" : ""),
           company_email: task.equipment?.company?.email || "",
           company_address: task.equipment?.company?.address
             ? [task.equipment.company.address.address_line, task.equipment.company.address.locality,
                 task.equipment.company.address.city, task.equipment.company.address.district,
                 task.equipment.company.address.state, task.equipment.company.address.pincode,
                 task.equipment.company.address.country].filter(Boolean).join(", ")
-            : "",
+            : individual ? task.address || "" : "",
           company_gst_number: task.equipment?.company?.gst_number || "",
-          raised_by_name: client?.name || "",
-          raised_by_phone: client?.phone || "",
-          raised_by_email: client?.email || "",
+          raised_by_name: individual ? task.contact_name || "" : client?.name || "",
+          raised_by_phone: individual ? task.contact_phone || "" : client?.phone || "",
+          raised_by_email: individual ? "" : client?.email || "",
+          contact_name: task.contact_name || "",
+          contact_phone: task.contact_phone || "",
+          address: task.address || "",
           raised_by_note: task.created_by
             ? `Created by ${task.created_by}`
             : "",

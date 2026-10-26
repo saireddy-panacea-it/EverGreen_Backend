@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { UserService } from '../user/user.service';
 import { JwtService } from '@nestjs/jwt';
+import { audit_action, audit_entity } from '@prisma/client';
 
 @Injectable()
 export class AuthService {
@@ -37,6 +38,13 @@ export class AuthService {
         });
       }
 
+      if (user.is_active === false) {
+        return res.send({
+          message: 'Your account is inactive. Contact your administrator.',
+          status: 403,
+        });
+      }
+
       const fcmId = req.body.fcm_id;
       const deviceId = req.body.device_id;
       if (fcmId && deviceId) {
@@ -48,6 +56,13 @@ export class AuthService {
       }
       const payload = { sub: user.id, username: user.email, phone: user.phone };
       user.password = undefined;
+      await this.userService.recordAudit(
+        user,
+        audit_action.logged_in,
+        audit_entity.auth,
+        user.id,
+        user.name,
+      );
       return res.send({
         data: user,
         message: 'login successful',

@@ -725,6 +725,138 @@ describe('UserService', () => {
   });
 });
 
+describe('UserService bulk uploads and TM frequency', () => {
+  let service: UserService;
+  const ExcelJS = require('exceljs');
+  const asUser = (access_level: string) =>
+    jest.spyOn(service, 'findOne').mockResolvedValue({ id: 1, name: 'U', phone: 'p', access_level, company_user: [{ company_link: 3 }] } as any);
+
+  beforeEach(async () => {
+    for (const key of Object.keys(mockPrisma)) delete mockPrisma[key];
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        UserService,
+        { provide: FirebaseService, useValue: {} },
+        { provide: NotificationService, useValue: {} },
+      ],
+    }).compile();
+    service = module.get<UserService>(UserService);
+  });
+
+  const equipmentSheet = async (frequencies: string[]) => {
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Equipment');
+    sheet.addRow(['Name', 'Make', 'Model', 'TM Frequency']);
+    frequencies.forEach((frequency, index) => sheet.addRow([`AC ${index}`, 'LG', `M${index}`, frequency]));
+    return { buffer: Buffer.from(await workbook.xlsx.writeBuffer()) };
+  };
+
+  it('refuses non-admins before reading the file', async () => {
+    const uploads = ['uploadCompanyData', 'uploadEquipmentData', 'uploadTechnicianData'];
+    for (const level of ['client', 'client_admin', 'technician', 'others']) {
+      for (const upload of uploads) {
+        asUser(level);
+        const loadRows = jest.spyOn(service as any, 'loadExcelRows');
+        const res = mockRes();
+        await (service as any)[upload](res, { user: { phone: 'p' }, body: { company_link: 3 } }, { buffer: Buffer.from('x') });
+        expect(sent(res)).toEqual({ status: 403, message: 'Only admins can bulk upload' });
+        expect(loadRows).not.toHaveBeenCalled();
+      }
+    }
+    expect(db('company').findUnique).not.toHaveBeenCalled();
+    expect(db('user').create).not.toHaveBeenCalled();
+    expect(db('equipment').create).not.toHaveBeenCalled();
+  });
+
+  it('lets admins through to file handling', async () => {
+    for (const level of ['eg_admin', 'eg_super_admin']) {
+      asUser(level);
+      const res = mockRes();
+      await service.uploadTechnicianData(res, { user: { phone: 'p' }, body: {} }, null);
+      expect(sent(res)).toEqual({ status: 409, message: 'No Excel file received' });
+    }
+  });
+
+  it('normalizes TM frequency labels and aliases', () => {
+    const cases: Record<string, string> = {
+      Daily: 'daily',
+      ' WEEKLY ': 'weekly',
+      'Bi Weekly': 'biweekly',
+      'bi-weekly': 'biweekly',
+      biweekly: 'biweekly',
+      Monthly: 'monthly',
+      'Bi-Monthly': 'bi_monthly',
+      'bi monthly': 'bi_monthly',
+      'Tri-Monthly': 'tri_monthly',
+      Quarterly: 'quarterly',
+      'Semi Annual': 'semi_annual',
+      semi_annual: 'semi_annual',
+      'Half Yearly': 'semi_annual',
+      half_yearly: 'semi_annual',
+      'half-yearly': 'semi_annual',
+      Yearly: 'annual',
+      Annual: 'annual',
+    };
+    for (const [input, expected] of Object.entries(cases)) {
+      expect(service.normalizeTmFrequency(input)).toBe(expected);
+    }
+    for (const input of ['Sometimes', 'hourly', '', null, undefined]) {
+      expect(service.normalizeTmFrequency(input)).toBeNull();
+    }
+  });
+
+  it('uploads equipment with normalized frequencies and reports unknown ones per row', async () => {
+    asUser('eg_admin');
+    db('company').findUnique.mockResolvedValue({ id: 3 });
+    const file = await equipmentSheet(['Quarterly', 'Bi-Monthly', 'Sometimes', 'half yearly', '']);
+    const res = mockRes();
+    await service.uploadEquipmentData(res, { user: { phone: 'p' }, body: { company_link: '3' } }, file);
+    const out = sent(res);
+    expect(out).toMatchObject({ status: 200, added: 4, skipped: 0, message: 'Added 4 equipment. 1 rows had errors' });
+    expect(out.errors).toEqual([
+      'Row 4: tm_frequency must be daily, weekly, biweekly, monthly, bi_monthly, tri_monthly, quarterly, semi_annual or annual (got "Sometimes")',
+    ]);
+    expect(db('equipment').create.mock.calls.map((call) => call[0].data.tm_frequency)).toEqual([
+      'quarterly',
+      'bi_monthly',
+      'semi_annual',
+      undefined,
+    ]);
+  });
+
+  it('validates tm_frequency on createEquipment', async () => {
+    asUser('eg_admin');
+    db('company').findUnique.mockResolvedValue({ id: 3 });
+    db('equipment').create.mockResolvedValue({ id: 8, name: 'AC' });
+    const bad = mockRes();
+    await service.createEquipment(bad, { user: { phone: 'p' }, body: { company_link: 3, name: 'AC', tm_frequency: 'Sometimes' } });
+    expect(sent(bad)).toEqual({
+      status: 400,
+      message: 'tm_frequency must be daily, weekly, biweekly, monthly, bi_monthly, tri_monthly, quarterly, semi_annual or annual',
+    });
+    expect(db('equipment').create).not.toHaveBeenCalled();
+
+    const ok = mockRes();
+    await service.createEquipment(ok, { user: { phone: 'p' }, body: { company_link: 3, name: 'AC', tm_frequency: 'Half Yearly' } });
+    expect(sent(ok)).toMatchObject({ status: 200 });
+    expect(db('equipment').create.mock.calls[0][0].data.tm_frequency).toBe('semi_annual');
+  });
+
+  it('validates tm_frequency on updateEquipment and keeps the saved value when omitted', async () => {
+    asUser('eg_admin');
+    db('equipment').findUnique.mockResolvedValue({ id: 8, name: 'AC', company_link: 3, status: 'operational', tm_frequency: 'monthly' });
+    db('equipment').update.mockResolvedValue({ id: 8, name: 'AC' });
+    const bad = mockRes();
+    await service.updateEquipment(bad, { user: { phone: 'p' }, body: { equipment_link: 8, tm_frequency: 'fortnight-ish' } });
+    expect(sent(bad)).toMatchObject({ status: 400 });
+    expect(db('equipment').update).not.toHaveBeenCalled();
+
+    await service.updateEquipment(mockRes(), { user: { phone: 'p' }, body: { equipment_link: 8, tm_frequency: 'Bi-Monthly' } });
+    await service.updateEquipment(mockRes(), { user: { phone: 'p' }, body: { equipment_link: 8, name: 'AC 2' } });
+    expect(db('equipment').update.mock.calls.map((call) => call[0].data.tm_frequency)).toEqual(['bi_monthly', 'monthly']);
+  });
+});
+
 describe('NotificationService with individual tasks', () => {
   let notifications: NotificationService;
 

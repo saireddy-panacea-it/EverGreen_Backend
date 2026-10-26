@@ -263,12 +263,212 @@ describe('UserService', () => {
       });
     });
 
+    it('limits clients and service engineers to their own entries', () => {
+      expect(service.auditScopeDecision({ id: 24, access_level: 'client', companyIds: [1] })).toEqual({
+        scope: 'self',
+        actorId: 24,
+      });
+      expect(service.auditScopeDecision({ id: 26, access_level: 'technician', companyIds: [] })).toEqual({
+        scope: 'self',
+        actorId: 26,
+      });
+    });
+
     it('denies everyone else, including unlinked client admins', () => {
-      expect(service.auditScopeDecision({ access_level: 'client_admin', companyIds: [] })).toEqual({ scope: 'none' });
-      for (const level of ['client', 'technician', 'others']) {
-        expect(service.auditScopeDecision({ access_level: level, companyIds: [1] })).toEqual({ scope: 'none' });
-      }
+      expect(service.auditScopeDecision({ id: 25, access_level: 'client_admin', companyIds: [] })).toEqual({
+        scope: 'none',
+      });
+      expect(service.auditScopeDecision({ id: 30, access_level: 'others', companyIds: [1] })).toEqual({ scope: 'none' });
+      expect(service.auditScopeDecision({ access_level: 'client', companyIds: [1] })).toEqual({ scope: 'none' });
       expect(service.auditScopeDecision(null)).toEqual({ scope: 'none' });
+    });
+  });
+
+  describe('getAuditLogs scoping', () => {
+    const users = {
+      admin: { id: 1, phone: 'p1', access_level: 'eg_admin', company_user: [] },
+      clientAdmin: { id: 25, phone: 'p25', access_level: 'client_admin', company_user: [{ company_link: 1 }, { company_link: 2 }] },
+      client: { id: 24, phone: 'p24', access_level: 'client', company_user: [{ company_link: 1 }] },
+      senior: { id: 26, phone: 'p26', access_level: 'technician', designation: 'Senior Service Engineer', company_user: [] },
+      junior: { id: 27, phone: 'p27', access_level: 'technician', designation: 'Junior Service Engineer', company_user: [] },
+    };
+    const run = async (user, body: Record<string, unknown> = {}) => {
+      db('user').findFirst.mockResolvedValue(user);
+      db('audit_log').count.mockResolvedValue(42);
+      db('audit_log').findMany.mockResolvedValue([{ id: 9 }]);
+      const res = mockRes();
+      await service.getAuditLogs(res, { user: { phone: user.phone }, body });
+      return res;
+    };
+
+    it('gives admins every entry', async () => {
+      const res = await run(users.admin);
+      expect(db('audit_log').findMany.mock.calls[0][0].where).toEqual({ entity: undefined });
+      expect(sent(res)).toMatchObject({ status: 200, total: 42, page: 1, limit: 20, data: [{ id: 9 }] });
+    });
+
+    it('gives client admins entries whose actor is in one of their companies', async () => {
+      await run(users.clientAdmin);
+      expect(db('audit_log').findMany.mock.calls[0][0].where).toEqual({
+        entity: undefined,
+        actor: { company_user: { some: { company_link: { in: [1, 2] } } } },
+      });
+    });
+
+    it.each([
+      ['client', users.client],
+      ['senior service engineer', users.senior],
+      ['junior service engineer', users.junior],
+    ])('gives a %s only the entries they acted on', async (_label, user) => {
+      const res = await run(user);
+      const expected = { entity: undefined, actor_link: user.id };
+      expect(db('audit_log').count.mock.calls[0][0].where).toEqual(expected);
+      expect(db('audit_log').findMany.mock.calls[0][0].where).toEqual(expected);
+      expect(sent(res).status).toBe(200);
+    });
+
+    it('keeps pagination and the entity filter on the self scope', async () => {
+      const res = await run(users.junior, { page: 3, limit: 5, entity: 'Task' });
+      const query = db('audit_log').findMany.mock.calls[0][0];
+      expect(query.where).toEqual({ entity: 'task', actor_link: 27 });
+      expect(query.skip).toBe(10);
+      expect(query.take).toBe(5);
+      expect(sent(res)).toMatchObject({ status: 200, page: 3, limit: 5, total: 42 });
+    });
+
+    it('still rejects an unknown entity filter', async () => {
+      const res = await run(users.client, { entity: 'nope' });
+      expect(sent(res).status).toBe(400);
+      expect(db('audit_log').findMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('single-equipment reads for client-side callers', () => {
+    const FORBIDDEN = { status: 403, message: 'This equipment does not belong to your company' };
+    const users = {
+      admin: { id: 1, phone: 'p1', access_level: 'eg_super_admin', company_user: [] },
+      technician: { id: 26, phone: 'p26', access_level: 'technician', designation: 'Junior Service Engineer', company_user: [] },
+      clientAdmin: { id: 25, phone: 'p25', access_level: 'client_admin', company_user: [{ company_link: 1 }] },
+      client: { id: 24, phone: 'p24', access_level: 'client', company_user: [{ company_link: 1 }] },
+    };
+    const own = { id: 10, company_link: 1, eg_serial_number: 'EG-10', company: { id: 1, name: 'Own' } };
+    const foreign = { id: 20, company_link: 2, eg_serial_number: 'EG-20', company: { id: 2, name: 'Other' } };
+    const asUser = (user) => {
+      db('user').findFirst.mockResolvedValue(user);
+      return { phone: user.phone, sub: user.id };
+    };
+
+    describe('getEquipmentInfo', () => {
+      const info = async (user, equipment, link: unknown = equipment?.id) => {
+        db('equipment').findUnique.mockResolvedValue(equipment);
+        db('equipment').findFirst.mockResolvedValue(equipment);
+        db('task_user').findMany.mockResolvedValue([]);
+        const res = mockRes();
+        await service.getEquipmentInfo(res, { user: asUser(user), body: { equipment_link: link } });
+        return sent(res);
+      };
+
+      it.each([
+        ['client', users.client],
+        ['client admin', users.clientAdmin],
+      ])('refuses a %s equipment from another company, by id or serial', async (_label, user) => {
+        expect(await info(user, foreign)).toEqual({ ...FORBIDDEN, success: 403 });
+        expect(await info(user, foreign, 'EG-20')).toEqual({ ...FORBIDDEN, success: 403 });
+        expect(db('task_user').findMany).not.toHaveBeenCalled();
+      });
+
+      it('refuses equipment with no company', async () => {
+        expect(await info(users.client, { ...foreign, company_link: null, company: null })).toMatchObject(FORBIDDEN);
+      });
+
+      it.each([
+        ['client', users.client, own],
+        ['client admin', users.clientAdmin, own],
+        ['admin', users.admin, foreign],
+        ['technician', users.technician, foreign],
+      ])('returns the equipment to a %s with access', async (_label, user, equipment) => {
+        const body = await info(user, equipment);
+        expect(body.success).toBe(200);
+        expect(body.data.id).toBe(equipment.id);
+      });
+
+      it('still reports a missing equipment as not found', async () => {
+        expect((await info(users.client, null, 999)).success).toBe(404);
+      });
+    });
+
+    describe('verifyEquipment', () => {
+      const verify = async (user, equipment) => {
+        db('equipment').findUnique.mockResolvedValue(equipment);
+        db('equipment').update.mockResolvedValue({ ...equipment, verified_by: user.id });
+        const res = mockRes();
+        await service.verifyEquipment(res, { user: asUser(user), body: { equipment_link: equipment.id } });
+        return sent(res);
+      };
+
+      it.each([
+        ['client', users.client],
+        ['client admin', users.clientAdmin],
+      ])('refuses a %s equipment from another company', async (_label, user) => {
+        expect(await verify(user, foreign)).toEqual(FORBIDDEN);
+        expect(db('equipment').update).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ['client', users.client, own],
+        ['admin', users.admin, foreign],
+        ['technician', users.technician, foreign],
+      ])('lets a %s with access verify', async (_label, user, equipment) => {
+        expect((await verify(user, equipment)).status).toBe(200);
+      });
+    });
+
+    describe('getAllEquipments with equipment_link', () => {
+      const list = async (user, equipment) => {
+        db('company_user').findMany.mockResolvedValue(user.company_user);
+        db('equipment').findUnique.mockResolvedValue(equipment);
+        db('equipment').findMany.mockResolvedValue([equipment]);
+        const res = mockRes();
+        await service.getAllEquipments(res, { user: asUser(user), body: { equipment_link: equipment.id } });
+        return sent(res);
+      };
+
+      it('refuses a client equipment from another company', async () => {
+        expect(await list(users.client, foreign)).toEqual(FORBIDDEN);
+        expect(db('equipment').findMany).not.toHaveBeenCalled();
+      });
+
+      it('returns own equipment to a client and any equipment to a technician', async () => {
+        expect((await list(users.client, own)).status).toBe(200);
+        expect((await list(users.technician, foreign)).status).toBe(200);
+      });
+    });
+
+    describe('qrCodeGenerator (generateEquipmentPDF)', () => {
+      const qr = async (user, body, rows) => {
+        db('equipment').findMany.mockResolvedValue(rows);
+        jest.spyOn(service, 'createPDF').mockResolvedValue(new Uint8Array([1]));
+        const res = mockRes();
+        res.setHeader = jest.fn();
+        await service.generateEquipmentPDF(res, { user: asUser(user), body });
+        return res;
+      };
+
+      it('refuses a client admin QR codes for another company or its equipment', async () => {
+        let res = await qr(users.clientAdmin, { company_link: 2 }, [foreign]);
+        expect(res.status).toHaveBeenCalledWith(403);
+        expect(sent(res)).toEqual(FORBIDDEN);
+        res = await qr(users.clientAdmin, { equipment_link: [10, 20] }, [own, foreign]);
+        expect(sent(res)).toEqual(FORBIDDEN);
+        expect(service.createPDF).not.toHaveBeenCalled();
+      });
+
+      it('builds the PDF for own equipment and for admins', async () => {
+        let res = await qr(users.clientAdmin, { company_link: 1 }, [own]);
+        expect(res.setHeader).toHaveBeenCalledWith('Content-Type', 'application/pdf');
+        res = await qr(users.admin, { company_link: 2 }, [foreign]);
+        expect(res.setHeader).toHaveBeenCalledWith('Content-Type', 'application/pdf');
+      });
     });
   });
 

@@ -14,7 +14,7 @@ model user {
   location          String       @db.VarChar(100) // Pre-req
   phone             String       @unique(map: "UK__user_phone") @db.VarChar(50)
   email             String       @db.VarChar(100) // TODO: @unique(map: "UK__user_email")
-  password          String       @db.VarChar(20)
+  password          String       @db.VarChar(100)
   notes             String?      @db.VarChar(500)
   access_level      access_level @default(client)
   designation       String?      @db.VarChar(50)

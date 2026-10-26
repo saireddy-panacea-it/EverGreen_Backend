@@ -1012,12 +1012,11 @@ export class UserService {
         include: includeCompany,
       });
     } else {
+      const isAdmin = this.adminOrNot(userInfo?.access_level);
       equipments = await prisma.equipment.findMany({
-        where: {
-          company_link: {
-            in: getCompanyLinks.map((x) => x.company_link),
-          },
-        },
+        where: isAdmin
+          ? undefined
+          : { company_link: { in: ownCompanyIds } },
         include: includeCompany,
       });
     }
@@ -1246,9 +1245,31 @@ export class UserService {
     return links.map((link) => link.company_link);
   }
 
+  /**
+   * Admins manage any equipment; clients and client admins only their own
+   * companies' equipment; technicians never. Returns a refusal message or null.
+   */
+  private async equipmentWriteDenied(req, companyId): Promise<string | null> {
+    const actor = await this.loadActor(req);
+    if (!actor) return "Please login again";
+    if (this.adminOrNot(actor.access_level)) return null;
+    if (this.isTechnicianRole(actor.access_level)) {
+      return "Technicians cannot manage equipment";
+    }
+    const id = parseInt(String(companyId), 10);
+    if (!Number.isFinite(id) || !actor.companyIds.includes(id)) {
+      return "You do not have access to this company's equipment";
+    }
+    return null;
+  }
+
   async createEquipment(res, req) {
     try {
       const companyLink = req.body.company_link;
+      const denied = await this.equipmentWriteDenied(req, companyLink);
+      if (denied) {
+        return res.send({ status: HttpStatus.FORBIDDEN, message: denied });
+      }
       const dbCompany = await prisma.company.findUnique({
         where: {
           id: companyLink,
@@ -1333,8 +1354,12 @@ export class UserService {
       if (!dbEquipment) {
         return res.send({
           status: 204,
-          message: `Equipment with ID ${dbEquipment} is not present in the database`,
+          message: `Equipment with ID ${equipmentId} is not present in the database`,
         });
+      }
+      const denied = await this.equipmentWriteDenied(req, dbEquipment.company_link);
+      if (denied) {
+        return res.send({ status: HttpStatus.FORBIDDEN, message: denied });
       }
 
       // Update equipment
@@ -1396,6 +1421,10 @@ export class UserService {
           status: 204,
           message: "Equipment not found",
         });
+      }
+      const denied = await this.equipmentWriteDenied(req, dbEquipment.company_link);
+      if (denied) {
+        return res.send({ status: HttpStatus.FORBIDDEN, message: denied });
       }
       await prisma.equipment.update({
         where: { id: equipmentId },
@@ -3297,17 +3326,20 @@ export class UserService {
       }
       console.log(equipmentLinks);
 
+      const selectors = [];
+      if (companyLink) selectors.push({ company_link: companyLink });
+      if (Array.isArray(equipmentLinks) && equipmentLinks.length > 0) {
+        selectors.push({ id: { in: equipmentLinks } });
+      }
+      if (selectors.length === 0) {
+        return res.status(400).send({
+          status: 400,
+          message: "Please provide either company_link or equipment_link",
+        });
+      }
+
       const equipmentList = await prisma.equipment.findMany({
-        where: {
-          OR: [
-            {
-              company_link: req.body.company_link,
-            },
-            {
-              id: { in: equipmentLinks },
-            },
-          ],
-        },
+        where: { OR: selectors },
         select: {
           id: true,
           eg_serial_number: true,
@@ -4098,6 +4130,13 @@ export class UserService {
   }
 
   async companiesStats(res, req) {
+    const requester = await this.findOne(req.user?.phone);
+    if (!requester || !this.adminOrNot(requester.access_level)) {
+      return res.send({
+        status: HttpStatus.FORBIDDEN,
+        message: "You do not have access to these stats",
+      });
+    }
     const now = moment();
     const months = [];
 
@@ -4136,6 +4175,13 @@ export class UserService {
   }
 
   async getUserStats(res, req) {
+    const requester = await this.findOne(req.user?.phone);
+    if (!requester || !this.adminOrNot(requester.access_level)) {
+      return res.send({
+        status: HttpStatus.FORBIDDEN,
+        message: "You do not have access to these stats",
+      });
+    }
     const accessLevels = [
       "client",
       "client_admin",

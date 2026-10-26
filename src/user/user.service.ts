@@ -1103,6 +1103,18 @@ export class UserService {
         message: "You do not have access to this company's equipment",
       });
     }
+    if (equipment_link != null && equipment_link !== "" && !unrestricted) {
+      const target = await prisma.equipment.findUnique({
+        where: { id: parseInt(String(equipment_link), 10) || -1 },
+        select: { company_link: true },
+      });
+      if (target && this.equipmentReadDenied(userInfo, target.company_link)) {
+        return res.send({
+          status: HttpStatus.FORBIDDEN,
+          message: UserService.FOREIGN_EQUIPMENT_MESSAGE,
+        });
+      }
+    }
     let equipments;
     const includeCompany = { company: true };
     if (equipment_link || companyLink) {
@@ -1177,6 +1189,13 @@ export class UserService {
     if (userInfo.access_level === access_level.technician) return true;
     const requested = parseInt(String(companyLink ?? ""), 10);
     return this.attachedCompanyIds(userInfo).includes(requested);
+  }
+
+  static readonly FOREIGN_EQUIPMENT_MESSAGE = "This equipment does not belong to your company";
+
+  /** Single-equipment reads: client-side callers only see equipment of their own companies. */
+  equipmentReadDenied(userInfo, companyLink): boolean {
+    return !this.canAccessCompany(userInfo, companyLink);
   }
 
   async storePasswordHash(userId: number, plain: string): Promise<void> {
@@ -1448,14 +1467,27 @@ export class UserService {
     return moment.utc(due).add(months, "months").toDate();
   }
 
-  /** Admins read every audit row; client admins only rows whose actor shares one of their companies. */
+  /**
+   * Admins read every audit row; client admins rows whose actor shares one of their companies;
+   * clients and service engineers only rows they acted on.
+   */
   auditScopeDecision(
-    actor: { access_level: access_level | string; companyIds: number[] } | null,
-  ): { scope: "all" } | { scope: "companies"; companyIds: number[] } | { scope: "none" } {
+    actor: { id?: number; access_level: access_level | string; companyIds: number[] } | null,
+  ):
+    | { scope: "all" }
+    | { scope: "companies"; companyIds: number[] }
+    | { scope: "self"; actorId: number }
+    | { scope: "none" } {
     if (!actor) return { scope: "none" };
     if (this.adminOrNot(actor.access_level)) return { scope: "all" };
     if (actor.access_level === access_level.client_admin && actor.companyIds.length > 0) {
       return { scope: "companies", companyIds: actor.companyIds };
+    }
+    if (
+      (actor.access_level === access_level.client || this.isTechnicianRole(actor.access_level)) &&
+      actor.id != null
+    ) {
+      return { scope: "self", actorId: actor.id };
     }
     return { scope: "none" };
   }
@@ -2828,6 +2860,14 @@ export class UserService {
         message: `Data not found for equipment: ${rawLink}`,
       });
     }
+    const requester = await this.findOne(req.user?.phone);
+    if (this.equipmentReadDenied(requester, equipment.company_link)) {
+      return res.send({
+        status: HttpStatus.FORBIDDEN,
+        success: HttpStatus.FORBIDDEN,
+        message: UserService.FOREIGN_EQUIPMENT_MESSAGE,
+      });
+    }
 
     const tasks = await prisma.task_user.findMany({
       where: {
@@ -4010,13 +4050,24 @@ export class UserService {
         });
       }
 
+      const requester = await this.findOne(req.user?.phone);
       const equipmentList = await prisma.equipment.findMany({
         where: { OR: selectors },
         select: {
           id: true,
           eg_serial_number: true,
+          company_link: true,
         },
       });
+      if (
+        (companyLink && this.equipmentReadDenied(requester, companyLink)) ||
+        equipmentList.some((item) => this.equipmentReadDenied(requester, item.company_link))
+      ) {
+        return res.status(403).send({
+          status: 403,
+          message: UserService.FOREIGN_EQUIPMENT_MESSAGE,
+        });
+      }
 
       const pdfBytes = await this.createPDF(equipmentList);
 
@@ -5482,8 +5533,8 @@ export class UserService {
     }
     const existing = await prisma.equipment.findUnique({ where: { id: equipmentId } });
     if (!existing) return res.send({ status: HttpStatus.NO_CONTENT, message: "Equipment not found" });
-    if (!this.canAccessCompany(userInfo, existing.company_link)) {
-      return res.send({ status: HttpStatus.FORBIDDEN, message: "You do not have access to this equipment" });
+    if (this.equipmentReadDenied(userInfo, existing.company_link)) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: UserService.FOREIGN_EQUIPMENT_MESSAGE });
     }
     const verified = await prisma.equipment.update({
       where: { id: equipmentId },
@@ -5749,6 +5800,7 @@ export class UserService {
       ...(scope.scope === "companies"
         ? { actor: { company_user: { some: { company_link: { in: scope.companyIds } } } } }
         : {}),
+      ...(scope.scope === "self" ? { actor_link: scope.actorId } : {}),
     };
     const [total, rows] = await Promise.all([
       prisma.audit_log.count({ where }),

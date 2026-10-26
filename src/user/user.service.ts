@@ -38,6 +38,9 @@ var QRCode = require("qrcode");
 import { PDFDocument, rgb } from "pdf-lib";
 import fs from "fs";
 const prisma = new PrismaClient();
+const SENIOR_DESIGNATION = "Senior Service Engineer";
+const JUNIOR_DESIGNATION = "Junior Service Engineer";
+const DESIGNATION_MESSAGE = `designation must be ${SENIOR_DESIGNATION} or ${JUNIOR_DESIGNATION}`;
 import nodemailer from "nodemailer";
 import { FirebaseService } from "../firebase/firebase.service"; // Update the import path as necessary
 import { NotificationService } from "../notification/notification.service";
@@ -70,7 +73,7 @@ export class UserService {
     if (technicianRole && req.body.designation && !designation) {
       return res.status(HttpStatus.BAD_REQUEST).send({
         status: HttpStatus.BAD_REQUEST,
-        message: "designation must be Senior Service Engineer or Junior Technician",
+        message: DESIGNATION_MESSAGE,
       });
     }
     const user: user = {
@@ -233,7 +236,7 @@ export class UserService {
     ) {
       return res.status(HttpStatus.BAD_REQUEST).send({
         status: HttpStatus.BAD_REQUEST,
-        message: "designation must be Senior Service Engineer or Junior Technician",
+        message: DESIGNATION_MESSAGE,
       });
     }
     if (req.body.password && String(req.body.password).length > 20) {
@@ -1538,7 +1541,7 @@ export class UserService {
     if (!actor) return "Please login again";
     if (this.adminOrNot(actor.access_level)) return null;
     if (this.isTechnicianRole(actor.access_level)) {
-      return "Technicians cannot manage equipment";
+      return "Service engineers cannot manage equipment";
     }
     const id = parseInt(String(companyId), 10);
     if (!Number.isFinite(id) || !actor.companyIds.includes(id)) {
@@ -1799,7 +1802,7 @@ export class UserService {
       if (triage.changed && !canTriage) {
         return res.send({
           status: HttpStatus.FORBIDDEN,
-          message: "Only admins or senior technicians can change priority, due date or manager",
+          message: "Only admins or senior service engineers can change priority, due date or manager",
         });
       }
       if (seniorOnly) {
@@ -1897,7 +1900,7 @@ export class UserService {
           select: { access_level: true, designation: true, is_active: true },
         });
         if (!manager || !manager.is_active || !this.canTriage(manager)) {
-          return { error: "manager_link must be an active admin or senior technician", status: HttpStatus.BAD_REQUEST };
+          return { error: "manager_link must be an active admin or senior service engineer", status: HttpStatus.BAD_REQUEST };
         }
       }
       data.manager_link = managerLink;
@@ -2300,7 +2303,7 @@ export class UserService {
     if (!this.canTriage(assigner) && !(selfAssign && this.isTechnicianRole(assigner?.access_level))) {
       return res.send({
         status: HttpStatus.FORBIDDEN,
-        message: "Only admins and senior technicians can assign other technicians",
+        message: "Only admins and senior service engineers can assign other service engineers",
       });
     }
     if (Number.isFinite(technicianLink)) {
@@ -2309,10 +2312,10 @@ export class UserService {
         select: { is_active: true },
       });
       if (!assignee) {
-        return res.send({ status: HttpStatus.NO_CONTENT, message: "technician not found" });
+        return res.send({ status: HttpStatus.NO_CONTENT, message: "service engineer not found" });
       }
       if (!assignee.is_active) {
-        return res.send({ status: HttpStatus.BAD_REQUEST, message: "This technician account is inactive" });
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: "This service engineer account is inactive" });
       }
     }
     const task = await prisma.tasks.findUnique({
@@ -2367,7 +2370,7 @@ export class UserService {
 
       if (taskUser) {
         response = {
-          message: `technician assigned successfully`,
+          message: `service engineer assigned successfully`,
           status: 200,
         };
         const now = new Date();
@@ -2416,7 +2419,7 @@ export class UserService {
         }
       } else {
         response = {
-          message: `technician already assigned`,
+          message: `service engineer already assigned`,
           status: 200,
         };
       }
@@ -2510,7 +2513,7 @@ export class UserService {
         taskStatus !== status.hold &&
         taskStatus !== status.completed) {
       return res.status(HttpStatus.FORBIDDEN).send({
-        message: "Technicians can move assigned tasks to In Progress, Hold, or Completed",
+        message: "Service engineers can move assigned tasks to In Progress, Hold, or Completed",
         status: HttpStatus.FORBIDDEN,
       });
     }
@@ -2542,7 +2545,7 @@ export class UserService {
     if (dbTaskUser) {
       if (dbTaskUser.technician_link == null) {
         return res.send({
-          message: `technician is not assigned to task. Cannot change the task status`,
+          message: `service engineer is not assigned to task. Cannot change the task status`,
           status: HttpStatus.NOT_FOUND,
         });
       }
@@ -3063,13 +3066,13 @@ export class UserService {
       if (row.status === "open" && row.technician_link) {
         timeline.push({
           time: this.formatReportTime(row.updated_at || row.created_at),
-          title: "Technician assigned",
-          detail: `${tech?.name || "Technician"} accepted this task${actor ? ` (${actor})` : ""}.`,
+          title: "Service engineer assigned",
+          detail: `${tech?.name || "Service engineer"} accepted this task${actor ? ` (${actor})` : ""}.`,
         });
       } else if (row.status === "open") {
         timeline.push({
           time: this.formatReportTime(row.created_at),
-          title: "Awaiting technician",
+          title: "Awaiting service engineer",
           detail: "Task is open and not assigned yet.",
         });
       } else if (row.status === "in_progress") {
@@ -3165,7 +3168,7 @@ export class UserService {
       technician: {
         name: technician?.name,
         phone: technician?.phone,
-        note: technician ? "Assigned technician" : "No technician assigned yet",
+        note: technician ? "Assigned service engineer" : "No service engineer assigned yet",
       },
       equipment: {
         name: task.equipment?.name,
@@ -3882,7 +3885,7 @@ export class UserService {
       return res.status(HttpStatus.FORBIDDEN).send({
         status: HttpStatus.FORBIDDEN,
         message: this.isSeniorTechnician(requester?.access_level, requester?.designation)
-          ? "Senior technicians can only list technicians"
+          ? "Senior service engineers can only list service engineers"
           : "You do not have access to the user list",
       });
     }
@@ -3891,7 +3894,7 @@ export class UserService {
     if (designation === "unclassified") {
       where.OR = [{ designation: null }, { designation: "" }];
     } else if (designation) {
-      where.designation = designation;
+      where.designation = this.normalizeTechnicianDesignation(designation) ?? designation;
     }
     if (!isAdmin && isClientAdmin) {
       where.company_user = { some: { company_link: { in: this.attachedCompanyIds(requester) } } };
@@ -4363,7 +4366,7 @@ export class UserService {
         if (!name && !phone && !email) continue;
         if (!name || !phone || !email || !password || !designation) {
           errors.push(
-            `Row ${item.rowNumber}: name, phone, email, password and a valid designation are required`
+            `Row ${item.rowNumber}: name, phone, email, password and a valid designation (${SENIOR_DESIGNATION} or ${JUNIOR_DESIGNATION}) are required`
           );
           continue;
         }
@@ -4401,7 +4404,7 @@ export class UserService {
 
       return res.status(200).send({
         status: 200,
-        message: this.uploadSummary(created, duplicates, errors, "technicians"),
+        message: this.uploadSummary(created, duplicates, errors, "service engineers"),
         errors: [...duplicates.map((item) => `Duplicate skipped: ${item}`), ...errors],
         added: created,
         skipped: duplicates.length,
@@ -4409,15 +4412,17 @@ export class UserService {
     } catch (e) {
       return res.status(200).send({
         status: HttpStatus.CONFLICT,
-        message: `Failed to upload technician data ${e}`,
+        message: `Failed to upload service engineer data ${e}`,
       });
     }
   }
 
   private normalizeTechnicianDesignation(value: unknown): string | null {
-    const normalized = String(value ?? "").trim().toLowerCase();
-    if (normalized === "senior service engineer") return "Senior Service Engineer";
-    if (normalized === "junior technician") return "Junior Technician";
+    const normalized = String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+    if (normalized === "senior service engineer") return SENIOR_DESIGNATION;
+    if (normalized === "junior service engineer" || normalized === "junior technician") {
+      return JUNIOR_DESIGNATION;
+    }
     return null;
   }
 
@@ -5079,7 +5084,7 @@ export class UserService {
   async approveTask(res, req) {
     const actor = await this.loadActor(req);
     if (!this.canTriage(actor)) {
-      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and senior technicians can approve tickets" });
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and senior service engineers can approve tickets" });
     }
     const ctx = await this.loadTaskContext(req.body?.task_link);
     if (!ctx) return res.send({ status: HttpStatus.NO_CONTENT, message: "Task not found" });
@@ -5106,7 +5111,7 @@ export class UserService {
   async rejectTask(res, req) {
     const actor = await this.loadActor(req);
     if (!this.canTriage(actor)) {
-      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and senior technicians can reject tickets" });
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and senior service engineers can reject tickets" });
     }
     const reason = String(req.body?.reason ?? "").trim();
     if (!reason) return res.send({ status: HttpStatus.BAD_REQUEST, message: "reason is required" });
@@ -5153,7 +5158,7 @@ export class UserService {
     const ctx = await this.loadTaskContext(req.body?.task_link);
     if (!ctx) return res.send({ status: HttpStatus.NO_CONTENT, message: "Task not found" });
     if (!actor || ctx.latest?.technician_link == null || ctx.latest.technician_link !== actor.id) {
-      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only the assigned technician can accept this ticket" });
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only the assigned service engineer can accept this ticket" });
     }
     if (ctx.latest.status === status.completed || ctx.latest.status === status.closed) {
       return res.send({ status: HttpStatus.BAD_REQUEST, message: "This ticket is already completed" });
@@ -5165,7 +5170,7 @@ export class UserService {
           data: { accepted_at: new Date(), updated_at: new Date(), updated_by: req.user?.phone },
         });
     if (!ctx.task.accepted_at) {
-      await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, "accepted by technician");
+      await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, "accepted by service engineer");
     }
     return res.status(200).send({ status: 200, message: "Ticket accepted", data: updated });
   }
@@ -5173,12 +5178,12 @@ export class UserService {
   async unassignTask(res, req) {
     const actor = await this.loadActor(req);
     if (!this.canTriage(actor)) {
-      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and senior technicians can unassign tickets" });
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and senior service engineers can unassign tickets" });
     }
     const ctx = await this.loadTaskContext(req.body?.task_link);
     if (!ctx) return res.send({ status: HttpStatus.NO_CONTENT, message: "Task not found" });
     if (!ctx.latest || ctx.latest.technician_link == null) {
-      return res.send({ status: HttpStatus.BAD_REQUEST, message: "No technician is assigned to this ticket" });
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "No service engineer is assigned to this ticket" });
     }
     const next = this.nextApprovalState("unassign", ctx.task.approval);
     if (!next || ctx.latest.status === status.completed || ctx.latest.status === status.closed) {
@@ -5203,7 +5208,7 @@ export class UserService {
         },
       });
     });
-    await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, `technician unassigned (was ${removedTechnician})`);
+    await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, `service engineer unassigned (was ${removedTechnician})`);
     await this.notifyTaskUsers(
       [removedTechnician],
       "Task unassigned",
@@ -5211,7 +5216,7 @@ export class UserService {
       `${actor.name} removed you from ticket ${updated.ticket_no}.`,
       actor.id,
     );
-    return res.status(200).send({ status: 200, message: "Technician unassigned", data: updated });
+    return res.status(200).send({ status: 200, message: "Service engineer unassigned", data: updated });
   }
 
   async escalateTask(res, req) {

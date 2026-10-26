@@ -268,7 +268,7 @@ export class ServiceReportService {
     const timeline = task.task_user.map((row) => {
       const assignedTech = row.technician_link ? userById[row.technician_link] : null;
       const titles = {
-        open: row.technician_link ? "Technician assigned" : "Task created",
+        open: row.technician_link ? "Service engineer assigned" : "Task created",
         in_progress: "Work started",
         hold: "Task placed on hold",
         completed: "Work completed; awaiting approval",
@@ -300,7 +300,7 @@ export class ServiceReportService {
         raised_by_email: client?.email || data.raised_by_email,
         technician_name: technician?.name || data.technician_name,
         technician_phone: technician?.phone || data.technician_phone,
-        technician_note: technician ? "Assigned technician" : "Not assigned yet",
+        technician_note: technician ? "Assigned service engineer" : "Not assigned yet",
         equipment_name: task.equipment.name,
         equipment_make: task.equipment.make,
         equipment_model: task.equipment.model,
@@ -772,7 +772,7 @@ export class ServiceReportService {
       for (const row of task.task_user) {
         const tech = row.technician_link ? userById[row.technician_link] : null;
         const titleByStatus = {
-          open: row.technician_link ? "Technician assigned" : "Awaiting technician",
+          open: row.technician_link ? "Service engineer assigned" : "Awaiting service engineer",
           in_progress: "Work started",
           hold: "Task placed on hold",
           completed: "Work completed; awaiting approval",
@@ -782,7 +782,7 @@ export class ServiceReportService {
           date: moment(row.updated_at || row.created_at).format("YYYY-MM-DD"),
           time: moment(row.updated_at || row.created_at).format("hh:mm A"),
           title: titleByStatus[row.status] || String(row.status),
-          description: row.reason || (tech ? `${tech.name || "Technician"} was assigned to this task.` : ""),
+          description: row.reason || (tech ? `${tech.name || "Service engineer"} was assigned to this task.` : ""),
         });
       }
       return res.status(200).send({
@@ -810,7 +810,7 @@ export class ServiceReportService {
             : "",
           technician_name: technician?.name || "",
           technician_phone: technician?.phone || "",
-          technician_note: technician ? "Assigned technician" : "",
+          technician_note: technician ? "Assigned service engineer" : "",
           equipment_name: task.equipment?.name || "",
           equipment_make: task.equipment?.make || "",
           equipment_model: task.equipment?.model || "",

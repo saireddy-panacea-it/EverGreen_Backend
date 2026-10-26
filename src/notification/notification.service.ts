@@ -252,7 +252,7 @@ EverGreen`;
       case ROLE.MANAGER:
         return 'Manager';
       case ROLE.TECHNICIAN:
-        return 'Technician';
+        return 'Service Engineer';
       case ROLE.AMC_MANAGER:
         return 'AMC Manager';
       case ROLE.CLIENT:
@@ -357,7 +357,7 @@ Please review this task in the EverGreen app.`,
     await this.pushToLevels(
       [ROLE.ADMIN],
       undefined,
-      'Technician assigned',
+      'Service engineer assigned',
       payload,
       opts.assignedByUserId,
     );
@@ -366,7 +366,7 @@ Please review this task in the EverGreen app.`,
       await this.pushToLevels(
         [ROLE.AMC_MANAGER],
         opts.companyLink,
-        'Technician assigned',
+        'Service engineer assigned',
         payload,
         opts.assignedByUserId,
       );
@@ -640,9 +640,9 @@ Please review this task in the EverGreen app.`,
     await this.pushToLevels(
       [ROLE.MANAGER],
       undefined,
-      'New technician added',
+      'New service engineer added',
       {
-        description: `${opts.technicianName} was added as a technician.`,
+        description: `${opts.technicianName} was added as a service engineer.`,
         image_url: '',
         task_link: '',
         channel_id: 'evergreen_normal',

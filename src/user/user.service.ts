@@ -4957,6 +4957,634 @@ export class UserService {
     }
   }
 
+  async register(res, req) {
+    const name = String(req.body?.name ?? "").trim();
+    const phone = String(req.body?.phone ?? "").trim();
+    const email = String(req.body?.email ?? "").trim();
+    const password = String(req.body?.password ?? "");
+    const location = String(req.body?.location ?? "").trim();
+    if (!name || !phone || !email || !password) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "name, phone, email and password are required" });
+    }
+    if (!/^(\+\d{1,3}[- ]?)?\d{10}$/.test(phone)) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "Please enter valid mobile number" });
+    }
+    if (!/^\S+@\S+\.\S+$/.test(email)) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "Please enter a valid email" });
+    }
+    if (password.length < 6 || password.length > 20) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "Password must be 6 to 20 characters" });
+    }
+    if (name.length > 200 || location.length > 100 || email.length > 100) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "name, email or location is too long" });
+    }
+    const phoneTaken = await prisma.user.findFirst({ where: { phone } });
+    if (phoneTaken) {
+      return res.send({ status: HttpStatus.NO_CONTENT, message: `user already exists with phone ${phone}` });
+    }
+    const emailTaken = await prisma.user.findFirst({
+      where: { email: { equals: email, mode: "insensitive" } },
+    });
+    if (emailTaken) {
+      return res.send({ status: HttpStatus.NO_CONTENT, message: "This email is already used by another user" });
+    }
+    const created = await prisma.user.create({
+      data: {
+        name,
+        phone,
+        email,
+        password,
+        location,
+        access_level: access_level.client,
+        is_active: false,
+        created_by: phone,
+        updated_by: phone,
+      },
+    });
+    try {
+      await this.notificationService.pushToLevels(
+        [access_level.eg_super_admin, access_level.eg_admin],
+        undefined,
+        "New registration",
+        {
+          description: `${name} (${phone}) registered and is waiting for activation.`,
+          image_url: "",
+          task_link: "",
+          channel_id: "evergreen_normal",
+          action: "",
+        },
+      );
+    } catch (notifyError) {
+      console.error("register notification failed", notifyError);
+    }
+    await this.recordAudit(created, audit_action.created, audit_entity.user, created.id, created.name, "self registration (inactive)");
+    return res.status(200).send({
+      status: 200,
+      message: "Registration received. An administrator will activate your account.",
+    });
+  }
+
+  async logout(res, req) {
+    const me = await this.findOne(req.user?.phone);
+    const deviceId = String(req.body?.device_id ?? "").trim();
+    const fcmId = String(req.body?.fcm_id ?? "").trim();
+    if (me && (deviceId || fcmId)) {
+      await prisma.tokens.deleteMany({
+        where: {
+          user_link: me.id,
+          ...(deviceId ? { device_id: deviceId } : {}),
+          ...(fcmId ? { fcm_id: fcmId } : {}),
+        },
+      });
+    }
+    if (me) {
+      await this.recordAudit(me, audit_action.logged_out, audit_entity.auth, me.id, me.name);
+    }
+    return res.status(200).send({ status: 200, message: "logged out" });
+  }
+
+  private async loadTaskContext(rawTaskLink) {
+    const taskId = parseInt(String(rawTaskLink ?? ""), 10);
+    if (!Number.isFinite(taskId)) return null;
+    const task = await prisma.tasks.findUnique({
+      where: { id: taskId },
+      include: {
+        equipment: { include: { company: true } },
+        task_user: { orderBy: { id: "desc" }, take: 1 },
+      },
+    });
+    if (!task) return null;
+    return { task, latest: task.task_user[0] ?? null };
+  }
+
+  private async notifyTaskUsers(userIds: Array<number | null | undefined>, title: string, task, description: string, excludeUserId?: number) {
+    try {
+      await this.notificationService.pushToUsers(
+        userIds.filter((id): id is number => id != null),
+        title,
+        this.notificationService.taskPayload(task, { description }),
+        excludeUserId,
+      );
+    } catch (notifyError) {
+      console.error(`${title} notification failed`, notifyError);
+    }
+  }
+
+  private stripTaskRelations(task) {
+    if (!task) return task;
+    const { task_user, equipment, ...rest } = task;
+    return rest;
+  }
+
+  async approveTask(res, req) {
+    const actor = await this.loadActor(req);
+    if (!this.canTriage(actor)) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and senior technicians can approve tickets" });
+    }
+    const ctx = await this.loadTaskContext(req.body?.task_link);
+    if (!ctx) return res.send({ status: HttpStatus.NO_CONTENT, message: "Task not found" });
+    const next = this.nextApprovalState("approve", ctx.task.approval);
+    if (!next) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: `Only requested tickets can be approved (current: ${ctx.task.approval})` });
+    }
+    const note = this.hasBodyValue(req.body?.note) ? String(req.body.note).trim() : null;
+    const updated = await prisma.tasks.update({
+      where: { id: ctx.task.id },
+      data: { approval: next, manager_link: actor.id, updated_at: new Date(), updated_by: req.user?.phone },
+    });
+    await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, note ? `approved: ${note}` : "approved");
+    await this.notifyTaskUsers(
+      [ctx.latest?.client_link],
+      "Ticket approved",
+      ctx.task,
+      `${actor.name} approved ticket ${updated.ticket_no}${note ? `: ${note}` : ""}.`,
+      actor.id,
+    );
+    return res.status(200).send({ status: 200, message: "Ticket approved", data: updated });
+  }
+
+  async rejectTask(res, req) {
+    const actor = await this.loadActor(req);
+    if (!this.canTriage(actor)) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and senior technicians can reject tickets" });
+    }
+    const reason = String(req.body?.reason ?? "").trim();
+    if (!reason) return res.send({ status: HttpStatus.BAD_REQUEST, message: "reason is required" });
+    const ctx = await this.loadTaskContext(req.body?.task_link);
+    if (!ctx) return res.send({ status: HttpStatus.NO_CONTENT, message: "Task not found" });
+    const next = this.nextApprovalState("reject", ctx.task.approval);
+    if (!next) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: `Only requested tickets can be rejected (current: ${ctx.task.approval})` });
+    }
+    const now = new Date();
+    const updated = await prisma.$transaction(async (tx) => {
+      if (ctx.latest) {
+        await tx.task_user.update({
+          where: { id: ctx.latest.id },
+          data: { status: status.closed, reason, updated_at: now, updated_by: req.user?.phone },
+        });
+      }
+      return tx.tasks.update({
+        where: { id: ctx.task.id },
+        data: {
+          approval: next,
+          status: status.closed,
+          rejection_reason: reason,
+          closed_at: now,
+          manager_link: ctx.task.manager_link ?? actor.id,
+          updated_at: now,
+          updated_by: req.user?.phone,
+        },
+      });
+    });
+    await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, `rejected: ${reason}`);
+    await this.notifyTaskUsers(
+      [ctx.latest?.client_link],
+      "Ticket rejected",
+      ctx.task,
+      `${actor.name} rejected ticket ${updated.ticket_no}: ${reason}`,
+      actor.id,
+    );
+    return res.status(200).send({ status: 200, message: "Ticket rejected", data: updated });
+  }
+
+  async acceptTask(res, req) {
+    const actor = await this.loadActor(req);
+    const ctx = await this.loadTaskContext(req.body?.task_link);
+    if (!ctx) return res.send({ status: HttpStatus.NO_CONTENT, message: "Task not found" });
+    if (!actor || ctx.latest?.technician_link == null || ctx.latest.technician_link !== actor.id) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only the assigned technician can accept this ticket" });
+    }
+    if (ctx.latest.status === status.completed || ctx.latest.status === status.closed) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "This ticket is already completed" });
+    }
+    const updated = ctx.task.accepted_at
+      ? this.stripTaskRelations(ctx.task)
+      : await prisma.tasks.update({
+          where: { id: ctx.task.id },
+          data: { accepted_at: new Date(), updated_at: new Date(), updated_by: req.user?.phone },
+        });
+    if (!ctx.task.accepted_at) {
+      await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, "accepted by technician");
+    }
+    return res.status(200).send({ status: 200, message: "Ticket accepted", data: updated });
+  }
+
+  async unassignTask(res, req) {
+    const actor = await this.loadActor(req);
+    if (!this.canTriage(actor)) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and senior technicians can unassign tickets" });
+    }
+    const ctx = await this.loadTaskContext(req.body?.task_link);
+    if (!ctx) return res.send({ status: HttpStatus.NO_CONTENT, message: "Task not found" });
+    if (!ctx.latest || ctx.latest.technician_link == null) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "No technician is assigned to this ticket" });
+    }
+    const next = this.nextApprovalState("unassign", ctx.task.approval);
+    if (!next || ctx.latest.status === status.completed || ctx.latest.status === status.closed) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "Completed or closed tickets cannot be unassigned" });
+    }
+    const removedTechnician = ctx.latest.technician_link;
+    const now = new Date();
+    const updated = await prisma.$transaction(async (tx) => {
+      await tx.task_user.update({
+        where: { id: ctx.latest.id },
+        data: { technician_link: null, status: status.open, updated_at: now, updated_by: req.user?.phone },
+      });
+      return tx.tasks.update({
+        where: { id: ctx.task.id },
+        data: {
+          assigned_at: null,
+          accepted_at: null,
+          approval: next,
+          status: status.open,
+          updated_at: now,
+          updated_by: req.user?.phone,
+        },
+      });
+    });
+    await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, `technician unassigned (was ${removedTechnician})`);
+    await this.notifyTaskUsers(
+      [removedTechnician],
+      "Task unassigned",
+      ctx.task,
+      `${actor.name} removed you from ticket ${updated.ticket_no}.`,
+      actor.id,
+    );
+    return res.status(200).send({ status: 200, message: "Technician unassigned", data: updated });
+  }
+
+  async escalateTask(res, req) {
+    const actor = await this.loadActor(req);
+    const reason = String(req.body?.reason ?? "").trim();
+    if (!reason) return res.send({ status: HttpStatus.BAD_REQUEST, message: "reason is required" });
+    const ctx = await this.loadTaskContext(req.body?.task_link);
+    if (!ctx) return res.send({ status: HttpStatus.NO_CONTENT, message: "Task not found" });
+    if (!this.canSeeTask(actor, ctx.latest?.technician_link, ctx.task.equipment?.company_link)) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "You do not have access to this ticket" });
+    }
+    const updated = await prisma.tasks.update({
+      where: { id: ctx.task.id },
+      data: { escalated: true, escalation_reason: reason, updated_at: new Date(), updated_by: req.user?.phone },
+    });
+    await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, `escalated: ${reason}`);
+    try {
+      await this.notificationService.pushToLevels(
+        [access_level.eg_super_admin, access_level.eg_admin],
+        undefined,
+        "Ticket escalated",
+        this.notificationService.taskPayload(ctx.task, {
+          description: `${actor.name} escalated ticket ${updated.ticket_no}: ${reason}`,
+        }),
+        actor.id,
+      );
+    } catch (notifyError) {
+      console.error("escalateTask notification failed", notifyError);
+    }
+    return res.status(200).send({ status: 200, message: "Ticket escalated", data: updated });
+  }
+
+  async deescalateTask(res, req) {
+    const actor = await this.loadActor(req);
+    if (!this.adminOrNot(actor?.access_level)) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins can de-escalate tickets" });
+    }
+    const ctx = await this.loadTaskContext(req.body?.task_link);
+    if (!ctx) return res.send({ status: HttpStatus.NO_CONTENT, message: "Task not found" });
+    const updated = await prisma.tasks.update({
+      where: { id: ctx.task.id },
+      data: { escalated: false, escalation_reason: null, updated_at: new Date(), updated_by: req.user?.phone },
+    });
+    await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, "de-escalated");
+    return res.status(200).send({ status: 200, message: "Ticket de-escalated", data: updated });
+  }
+
+  async verifyEquipment(res, req) {
+    const userInfo = await this.findOne(req.user?.phone);
+    const equipmentId = parseInt(String(req.body?.equipment_link ?? ""), 10);
+    if (!Number.isFinite(equipmentId)) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "equipment_link is required" });
+    }
+    const existing = await prisma.equipment.findUnique({ where: { id: equipmentId } });
+    if (!existing) return res.send({ status: HttpStatus.NO_CONTENT, message: "Equipment not found" });
+    if (!this.canAccessCompany(userInfo, existing.company_link)) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "You do not have access to this equipment" });
+    }
+    const verified = await prisma.equipment.update({
+      where: { id: equipmentId },
+      data: { verified_at: new Date(), verified_by: userInfo.id },
+      include: { company: true, verifier: { select: { id: true, name: true } } },
+    });
+    await this.recordAudit(userInfo, audit_action.updated, audit_entity.equipment, verified.id, verified.name, "verified");
+    return res.status(200).send({ status: 200, message: "Equipment verified", data: verified });
+  }
+
+  /** Equipment filter for read-only lists: admins and technicians see all companies, others their own. */
+  private equipmentReadScope(userInfo, rawCompanyLink): { where: Record<string, unknown> } | { error: string; status: number } {
+    if (this.hasBodyValue(rawCompanyLink)) {
+      const companyId = parseInt(String(rawCompanyLink), 10);
+      if (!Number.isFinite(companyId)) return { error: "company_link must be a number", status: HttpStatus.BAD_REQUEST };
+      if (!this.canAccessCompany(userInfo, companyId)) {
+        return { error: "You do not have access to this company", status: HttpStatus.FORBIDDEN };
+      }
+      return { where: { company_link: companyId } };
+    }
+    if (this.adminOrNot(userInfo?.access_level) || this.isTechnicianRole(userInfo?.access_level)) {
+      return { where: {} };
+    }
+    return { where: { company_link: { in: this.attachedCompanyIds(userInfo) } } };
+  }
+
+  async getVerifiedEquipments(res, req) {
+    const userInfo = await this.findOne(req.user?.phone);
+    const scope = this.equipmentReadScope(userInfo, req.body?.company_link);
+    if ("error" in scope) return res.send({ status: scope.status, message: scope.error });
+    const rows = await prisma.equipment.findMany({
+      where: { ...scope.where, verified_at: { not: null } },
+      include: { company: true, verifier: { select: { id: true, name: true } } },
+      orderBy: { verified_at: "desc" },
+    });
+    return res.status(200).send({ status: 200, message: "verified equipments retrieved", data: rows });
+  }
+
+  async getPmSchedules(res, req) {
+    const userInfo = await this.findOne(req.user?.phone);
+    const scope = this.equipmentReadScope(userInfo, req.body?.company_link);
+    if ("error" in scope) return res.send({ status: scope.status, message: scope.error });
+    const rows = await prisma.pm_schedule.findMany({
+      where: { equipment: scope.where },
+      include: { equipment: { include: { company: true } } },
+      orderBy: { next_due: "asc" },
+    });
+    return res.status(200).send({ status: 200, message: "PM schedules retrieved", data: rows });
+  }
+
+  private async pmAdmin(req, res) {
+    const actor = await this.findOne(req.user?.phone);
+    if (!this.adminOrNot(actor?.access_level)) {
+      res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins can manage PM schedules" });
+      return null;
+    }
+    return actor;
+  }
+
+  async createPmSchedule(res, req) {
+    const actor = await this.pmAdmin(req, res);
+    if (!actor) return;
+    const equipmentId = parseInt(String(req.body?.equipment_link ?? ""), 10);
+    const frequency = this.normalizePmFrequency(req.body?.frequency);
+    const nextDue = this.parseOptionalDate(req.body?.next_due);
+    if (!Number.isFinite(equipmentId)) return res.send({ status: HttpStatus.BAD_REQUEST, message: "equipment_link is required" });
+    if (!frequency) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "frequency must be monthly, quarterly, half_yearly or yearly" });
+    }
+    if (!(nextDue instanceof Date)) return res.send({ status: HttpStatus.BAD_REQUEST, message: "next_due must be an ISO date" });
+    const equipmentRow = await prisma.equipment.findUnique({ where: { id: equipmentId } });
+    if (!equipmentRow) return res.send({ status: HttpStatus.NO_CONTENT, message: "Equipment not found" });
+    const created = await prisma.pm_schedule.create({
+      data: { equipment_link: equipmentId, frequency, next_due: nextDue, created_by: actor.phone },
+      include: { equipment: { include: { company: true } } },
+    });
+    await this.recordAudit(actor, audit_action.created, audit_entity.equipment, equipmentRow.id, equipmentRow.name, `PM schedule ${created.id} (${frequency})`);
+    return res.status(200).send({ status: 200, message: "PM schedule created", data: created });
+  }
+
+  async updatePmSchedule(res, req) {
+    const actor = await this.pmAdmin(req, res);
+    if (!actor) return;
+    const scheduleId = parseInt(String(req.body?.pm_schedule_link ?? ""), 10);
+    if (!Number.isFinite(scheduleId)) return res.send({ status: HttpStatus.BAD_REQUEST, message: "pm_schedule_link is required" });
+    const existing = await prisma.pm_schedule.findUnique({ where: { id: scheduleId } });
+    if (!existing) return res.send({ status: HttpStatus.NO_CONTENT, message: "PM schedule not found" });
+    const data: { frequency?: pm_frequency; next_due?: Date; is_active?: boolean; updated_at: Date } = { updated_at: new Date() };
+    if (this.hasBodyValue(req.body?.frequency)) {
+      const frequency = this.normalizePmFrequency(req.body.frequency);
+      if (!frequency) {
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: "frequency must be monthly, quarterly, half_yearly or yearly" });
+      }
+      data.frequency = frequency;
+    }
+    if (this.hasBodyValue(req.body?.next_due)) {
+      const nextDue = this.parseOptionalDate(req.body.next_due);
+      if (!(nextDue instanceof Date)) return res.send({ status: HttpStatus.BAD_REQUEST, message: "next_due must be an ISO date" });
+      data.next_due = nextDue;
+    }
+    if (req.body?.is_active !== undefined) {
+      const isActive = this.parseBoolean(req.body.is_active);
+      if (isActive == null) return res.send({ status: HttpStatus.BAD_REQUEST, message: "is_active must be true or false" });
+      data.is_active = isActive;
+    }
+    const updated = await prisma.pm_schedule.update({
+      where: { id: scheduleId },
+      data,
+      include: { equipment: { include: { company: true } } },
+    });
+    await this.recordAudit(actor, audit_action.updated, audit_entity.equipment, updated.equipment_link, updated.equipment?.name, `PM schedule ${updated.id} updated`);
+    return res.status(200).send({ status: 200, message: "PM schedule updated", data: updated });
+  }
+
+  async deletePmSchedule(res, req) {
+    const actor = await this.pmAdmin(req, res);
+    if (!actor) return;
+    const scheduleId = parseInt(String(req.body?.pm_schedule_link ?? ""), 10);
+    if (!Number.isFinite(scheduleId)) return res.send({ status: HttpStatus.BAD_REQUEST, message: "pm_schedule_link is required" });
+    const existing = await prisma.pm_schedule.findUnique({ where: { id: scheduleId }, include: { equipment: true } });
+    if (!existing) return res.send({ status: HttpStatus.NO_CONTENT, message: "PM schedule not found" });
+    await prisma.pm_schedule.delete({ where: { id: scheduleId } });
+    await this.recordAudit(actor, audit_action.deleted, audit_entity.equipment, existing.equipment_link, existing.equipment?.name, `PM schedule ${scheduleId} deleted`);
+    return res.status(200).send({ status: 200, message: "PM schedule deleted", data: { id: scheduleId } });
+  }
+
+  async generatePmTasks(res, req) {
+    const actor = await this.pmAdmin(req, res);
+    if (!actor) return;
+    const rawDays = req.body?.days_ahead;
+    const daysAhead = this.hasBodyValue(rawDays) ? Number(rawDays) : 7;
+    if (!Number.isFinite(daysAhead) || daysAhead < 0 || daysAhead > 365) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "days_ahead must be between 0 and 365" });
+    }
+    const windowEnd = moment.utc().add(daysAhead, "days").toDate();
+    const schedules = await prisma.pm_schedule.findMany({
+      where: { is_active: true, next_due: { lte: windowEnd }, equipment: { is_active: true } },
+      include: { equipment: true },
+      orderBy: { next_due: "asc" },
+    });
+    const generated = [];
+    for (const schedule of schedules) {
+      if (schedule.equipment.status === equipment_status.retired) continue;
+      try {
+        const row = await prisma.$transaction(async (tx) => {
+          const claimed = await tx.pm_schedule.updateMany({
+            where: { id: schedule.id, next_due: schedule.next_due, is_active: true },
+            data: { next_due: this.advancePmDueDate(schedule.next_due, schedule.frequency), updated_at: new Date() },
+          });
+          if (claimed.count !== 1) return null;
+          const clientAdmin = schedule.equipment.company_link
+            ? await tx.company_user.findFirst({
+                where: { company_link: schedule.equipment.company_link, user: { access_level: access_level.client_admin } },
+                orderBy: { assigned_at: "asc" },
+                select: { user_link: true },
+              })
+            : null;
+          const name = `PM - ${schedule.equipment.name}`;
+          const description = `Preventive maintenance due ${moment.utc(schedule.next_due).format("YYYY-MM-DD")} (${schedule.frequency})`;
+          const task = await tx.tasks.create({
+            data: {
+              name,
+              description,
+              equipment_link: schedule.equipment_link,
+              call_type: call_type.amc_preventive_maintenance,
+              ticket_no: getAccountFromCompany(name + description + call_type.amc_preventive_maintenance),
+              otp: this.generateOtp(),
+              status: status.open,
+              approval: approval_state.approved,
+              priority: task_priority.medium,
+              due_date: schedule.next_due,
+              manager_link: actor.id,
+              created_by: actor.phone,
+              updated_by: actor.phone,
+            },
+          });
+          await tx.task_user.create({
+            data: {
+              client_link: clientAdmin?.user_link ?? actor.id,
+              task_link: task.id,
+              status: status.open,
+              created_by: actor.phone,
+              updated_by: actor.phone,
+            },
+          });
+          return tx.pm_generated_task.create({
+            data: { schedule_link: schedule.id, task_link: task.id, due_date: schedule.next_due },
+            include: { task: true, schedule: { include: { equipment: { include: { company: true } } } } },
+          });
+        });
+        if (row) {
+          generated.push(row);
+          await this.recordAudit(actor, audit_action.created, audit_entity.task, row.task_link, row.task?.ticket_no, `PM task for schedule ${schedule.id}`);
+        }
+      } catch (error) {
+        this.logger.error(`PM generation failed for schedule ${schedule.id}`, error);
+      }
+    }
+    return res.status(200).send({
+      status: 200,
+      message: `Generated ${generated.length} PM task${generated.length === 1 ? "" : "s"}`,
+      data: generated,
+    });
+  }
+
+  async getPmGeneratedTasks(res, req) {
+    const userInfo = await this.findOne(req.user?.phone);
+    const scope = this.equipmentReadScope(userInfo, req.body?.company_link);
+    if ("error" in scope) return res.send({ status: scope.status, message: scope.error });
+    const scheduleId = this.hasBodyValue(req.body?.schedule_link) ? parseInt(String(req.body.schedule_link), 10) : undefined;
+    if (scheduleId !== undefined && !Number.isFinite(scheduleId)) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "schedule_link must be a number" });
+    }
+    const rows = await prisma.pm_generated_task.findMany({
+      where: { schedule_link: scheduleId, schedule: { equipment: scope.where } },
+      include: {
+        task: { select: { id: true, ticket_no: true, name: true, status: true, approval: true, due_date: true } },
+        schedule: {
+          include: {
+            equipment: {
+              select: {
+                id: true,
+                name: true,
+                eg_serial_number: true,
+                company: { select: { id: true, name: true, branch_name: true } },
+              },
+            },
+          },
+        },
+      },
+      orderBy: { generated_at: "desc" },
+      take: 500,
+    });
+    const data = rows.map((row) => ({
+      ...row,
+      frequency: row.schedule.frequency,
+      equipment_name: row.schedule.equipment?.name ?? null,
+      company_name: this.companyLabel(row.schedule.equipment?.company ?? null),
+    }));
+    return res.status(200).send({ status: 200, message: "PM generated tasks retrieved", data });
+  }
+
+  async getAuditLogs(res, req) {
+    const actor = await this.loadActor(req);
+    const scope = this.auditScopeDecision(actor);
+    if (scope.scope === "none") {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "You do not have access to the audit log" });
+    }
+    const rawPage = Number(req.body?.page);
+    const rawLimit = Number(req.body?.limit);
+    const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1;
+    const limit = Number.isFinite(rawLimit) && rawLimit >= 1 ? Math.min(100, Math.floor(rawLimit)) : 20;
+    let entity: audit_entity | undefined;
+    if (this.hasBodyValue(req.body?.entity)) {
+      const requested = String(req.body.entity).trim().toLowerCase();
+      if (!(Object.values(audit_entity) as string[]).includes(requested)) {
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: "entity must be user, task, amc, equipment or auth" });
+      }
+      entity = requested as audit_entity;
+    }
+    const where = {
+      entity,
+      ...(scope.scope === "companies"
+        ? { actor: { company_user: { some: { company_link: { in: scope.companyIds } } } } }
+        : {}),
+    };
+    const [total, rows] = await Promise.all([
+      prisma.audit_log.count({ where }),
+      prisma.audit_log.findMany({
+        where,
+        orderBy: [{ created_at: "desc" }, { id: "desc" }],
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+    ]);
+    return res.status(200).send({
+      status: 200,
+      message: "audit logs retrieved",
+      data: rows,
+      total,
+      page,
+      limit,
+    });
+  }
+
+  async getMonthlyStats(res, req) {
+    const actor = await this.loadActor(req);
+    if (!this.canTriage(actor)) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "You do not have access to these stats" });
+    }
+    const thisMonth = moment.utc().startOf("month");
+    const months = [];
+    for (let index = 0; index < 12; index++) {
+      const start = thisMonth.clone().subtract(11 - index, "months");
+      const range = { gte: start.toDate(), lt: start.clone().add(1, "month").toDate() };
+      const [tasksCreated, tasksClosed, companies, users] = await Promise.all([
+        prisma.tasks.count({ where: { created_at: range } }),
+        prisma.tasks.count({ where: { closed_at: range } }),
+        prisma.company.count({ where: { created_at: range } }),
+        prisma.user.count({ where: { created_at: range } }),
+      ]);
+      months.push({
+        month: start.format("YYYY-MM"),
+        tasks_created: tasksCreated,
+        tasks_closed: tasksClosed,
+        companies,
+        users,
+      });
+    }
+    return res.status(200).send({
+      status: 200,
+      message: "monthly stats",
+      data: { months, current: months[11], previous: months[10] },
+    });
+  }
+
   getFileUrl(filePath: string): string {
     // Assuming you have a base URL set up in your environment variables
     const baseUrl = process.env.BASE_URL || "http://localhost:8080";

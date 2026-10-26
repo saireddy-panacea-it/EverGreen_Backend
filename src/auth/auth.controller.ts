@@ -17,6 +17,17 @@ export class AuthController {
     return await this.authService.signIn(res, req);
   }
 
+  @apiKeyAuth()
+  @Post('register')
+  async register(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.register(res, req);
+  }
+
+  @Post('logout')
+  async logout(@Res() res: Response, @Req() req) {
+    return await this.userService.logout(res, req);
+  }
+
   @Get('me')
   async me(@Res() res: Response, @Req() req) {
     return await this.userService.getMe(res, req);

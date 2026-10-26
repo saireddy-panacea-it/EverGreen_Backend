@@ -47,6 +47,17 @@ export class UserService {
     private readonly notificationService: NotificationService,
   ) {}
   async createUser(res, req) {
+    const actor = await this.loadActor(req);
+    const requestedLevel = mapAccessLevelToEnum(req.body.access_level) ?? access_level.client;
+    const permission = this.createUserDecision(
+      actor?.access_level,
+      actor?.companyIds ?? [],
+      requestedLevel,
+      this.isTechnicianRole(requestedLevel) ? [] : this.parseCompanyIds(req.body.company_link),
+    );
+    if (permission.allowed === false) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: permission.message });
+    }
     const technicianRole = this.isTechnicianRole(req.body.access_level);
     const designation = this.normalizeTechnicianDesignation(req.body.designation);
     if (technicianRole && req.body.designation && !designation) {
@@ -62,7 +73,7 @@ export class UserService {
       phone: req.body.phone,
       email: req.body.email,
       notes: req.body.notes,
-      access_level: req.body.access_level,
+      access_level: mapAccessLevelToEnum(req.body.access_level) ?? req.body.access_level,
       designation: technicianRole ? designation : null,
       pan_id: req.body.pan_id,
       aadhaar_id: req.body.aadhaar_id,
@@ -111,19 +122,14 @@ export class UserService {
     if (dbUser != null) {
       const companyLinks = this.isTechnicianRole(req.body.access_level)
         ? []
-        : Array.isArray(req.body.company_link)
-          ? req.body.company_link
-          : req.body.company_link != null
-            ? [req.body.company_link]
-            : [];
-      console.log(companyLinks);
-      if (companyLinks?.length > 0) {
+        : permission.companyIds;
+      if (companyLinks.length > 0) {
         for (const companyLink of companyLinks) {
           const dbCompanyUser = await prisma.company_user.findUnique({
             where: {
               user_link_company_link: {
                 user_link: dbUser.id,
-                company_link: parseInt(companyLink),
+                company_link: companyLink,
               },
             },
           });
@@ -132,7 +138,7 @@ export class UserService {
             await prisma.company_user.create({
               data: {
                 user_link: dbUser.id,
-                company_link: parseInt(companyLink),
+                company_link: companyLink,
               },
             });
           }
@@ -145,9 +151,7 @@ export class UserService {
           const actor = await this.findOne(req.user?.phone);
           await this.notificationService.onNewTechnician({
             technicianName: dbUser.name,
-            companyLink: companyLinks?.length
-              ? parseInt(companyLinks[0], 10)
-              : undefined,
+            companyLink: companyLinks.length ? companyLinks[0] : undefined,
             actorUserId: actor?.id,
           });
         }
@@ -157,7 +161,7 @@ export class UserService {
 
       return res.status(200).send({
         status: 200,
-        data: dbUser,
+        data: this.withoutPassword(dbUser),
         message: "user created succesfully",
       });
     } else {
@@ -169,128 +173,154 @@ export class UserService {
   }
 
   async updateUser(id, res, req) {
-    const existingUser = await prisma.user.findFirst({
-      where: {
-        id: parseInt(id),
-      },
-    });
-    if (existingUser) {
-      const nextAccessLevel = req.body.access_level ?? existingUser.access_level;
-      const designation = this.normalizeTechnicianDesignation(req.body.designation);
-      if (
-        this.isTechnicianRole(nextAccessLevel) &&
-        req.body.designation &&
-        !designation
-      ) {
-        return res.status(HttpStatus.BAD_REQUEST).send({
-          status: HttpStatus.BAD_REQUEST,
-          message: "designation must be Senior Service Engineer or Junior Technician",
-        });
-      }
-      if (req.body.email && String(req.body.email).trim() !== "") {
-        const emailTaken = await prisma.user.findFirst({
-          where: {
-            email: { equals: String(req.body.email).trim(), mode: "insensitive" },
-            NOT: { id: parseInt(id) },
-          },
-        });
-        if (emailTaken) {
-          return res.send({
-            status: 204,
-            message: "This email is already used by another user",
-          });
-        }
-      }
-      const user = {
-        name: req.body.name ?? existingUser?.name,
-        location: req.body.location ?? existingUser?.location,
-        access_level: req.body.access_level ?? existingUser?.access_level,
-        designation: this.isTechnicianRole(nextAccessLevel)
-          ? designation ?? existingUser.designation
-          : null,
-        email: req.body.email ?? existingUser?.email,
-        phone: req.body.phone ?? existingUser?.phone,
-        updated_by: req.body.phone ?? existingUser?.phone,
-        password: req.body.password || existingUser?.password,
-      };
-      const dbUser = await prisma.user.update({
-        where: {
-          id: parseInt(id),
-        },
-        data: user,
-      });
-      if (dbUser != null) {
-        const companyLinks = this.isTechnicianRole(dbUser.access_level)
-          ? []
-          : req.body.company_link;
-        if (this.isTechnicianRole(dbUser.access_level)) {
-          await prisma.company_user.deleteMany({
-            where: { user_link: dbUser.id },
-          });
-        }
-        if (companyLinks?.length > 0) {
-          const userId = dbUser.id; // Assuming `dbUser` contains the user information
-
-          // Fetch existing company-user associations for the user
-          const existingCompanyUsers = await prisma.company_user.findMany({
-            where: { user_link: userId },
-          });
-
-          // Extract existing company IDs
-          const existingCompanyIds = existingCompanyUsers.map(
-            (companyUser) => companyUser.company_link
-          );
-
-          // Determine companies to add and remove
-          const incomingCompanyIds = companyLinks.map((id: string) =>
-            parseInt(id)
-          ); // Convert to integers if needed
-          const companiesToAdd = incomingCompanyIds.filter(
-            (id: number) => !existingCompanyIds.includes(id)
-          );
-          const companiesToRemove = existingCompanyIds.filter(
-            (id: number) => !incomingCompanyIds.includes(id)
-          );
-
-          // Add new associations
-          for (const companyId of companiesToAdd) {
-            await prisma.company_user.create({
-              data: {
-                user_link: userId,
-                company_link: companyId,
-              },
-            });
-          }
-
-          // Remove outdated associations
-          for (const companyId of companiesToRemove) {
-            await prisma.company_user.deleteMany({
-              where: {
-                user_link: userId,
-                company_link: companyId,
-              },
-            });
-          }
-
-          console.log("Company associations updated successfully.");
-        }
-        return res.status(200).send({
-          status: 200,
-          data: dbUser,
-          message: "user updated succesfully",
-        });
-      } else {
-        return res.send({
-          status: 204,
-          message: `no user updated.`,
-        });
-      }
-    } else {
+    const userId = parseInt(id, 10);
+    const existingUser = Number.isFinite(userId)
+      ? await prisma.user.findFirst({ where: { id: userId } })
+      : null;
+    if (!existingUser) {
       return res.send({
         message: `user not found`,
         status: 404,
       });
     }
+
+    const actor = await this.loadActor(req);
+    const rawLevel = req.body.access_level;
+    const requestedLevel =
+      rawLevel != null && rawLevel !== "" ? mapAccessLevelToEnum(rawLevel) : undefined;
+    if (rawLevel != null && rawLevel !== "" && !requestedLevel) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "Invalid access level" });
+    }
+    const requestedCompanyIds =
+      req.body.company_link != null ? this.parseCompanyIds(req.body.company_link) : undefined;
+    const permission = actor
+      ? this.updateUserDecision(
+          actor,
+          {
+            id: existingUser.id,
+            access_level: existingUser.access_level,
+            companyIds: await this.companyIdsOf(existingUser.id),
+          },
+          requestedLevel,
+          requestedCompanyIds,
+        )
+      : ({ allowed: false, message: "You do not have access to update this user" } as const);
+    if (permission.allowed === false) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: permission.message });
+    }
+    const selfOnly = permission.mode === "self";
+
+    const nextAccessLevel = selfOnly
+      ? existingUser.access_level
+      : requestedLevel ?? existingUser.access_level;
+    const designation = this.normalizeTechnicianDesignation(req.body.designation);
+    if (
+      this.isTechnicianRole(nextAccessLevel) &&
+      req.body.designation &&
+      !designation
+    ) {
+      return res.status(HttpStatus.BAD_REQUEST).send({
+        status: HttpStatus.BAD_REQUEST,
+        message: "designation must be Senior Service Engineer or Junior Technician",
+      });
+    }
+    if (req.body.password && String(req.body.password).length > 20) {
+      return res.send({
+        status: HttpStatus.BAD_REQUEST,
+        message: "Password must be at most 20 characters",
+      });
+    }
+    if (req.body.email && String(req.body.email).trim() !== "") {
+      const emailTaken = await prisma.user.findFirst({
+        where: {
+          email: { equals: String(req.body.email).trim(), mode: "insensitive" },
+          NOT: { id: userId },
+        },
+      });
+      if (emailTaken) {
+        return res.send({
+          status: 204,
+          message: "This email is already used by another user",
+        });
+      }
+    }
+    if (req.body.phone && String(req.body.phone).trim() !== existingUser.phone) {
+      const phoneTaken = await prisma.user.findFirst({
+        where: { phone: String(req.body.phone).trim(), NOT: { id: userId } },
+      });
+      if (phoneTaken) {
+        return res.send({
+          status: 204,
+          message: `user already exists with phone ${phoneTaken.phone}`,
+        });
+      }
+    }
+    const user = {
+      name: req.body.name ?? existingUser?.name,
+      location: req.body.location ?? existingUser?.location,
+      access_level: nextAccessLevel,
+      designation: this.isTechnicianRole(nextAccessLevel)
+        ? designation ?? existingUser.designation
+        : null,
+      email: req.body.email ?? existingUser?.email,
+      phone: req.body.phone ?? existingUser?.phone,
+      updated_by: req.user?.phone ?? existingUser?.phone,
+      password: req.body.password || existingUser?.password,
+    };
+    const dbUser = await prisma.user.update({
+      where: {
+        id: userId,
+      },
+      data: user,
+    });
+    if (dbUser == null) {
+      return res.send({
+        status: 204,
+        message: `no user updated.`,
+      });
+    }
+
+    if (!selfOnly) {
+      if (this.isTechnicianRole(dbUser.access_level)) {
+        await prisma.company_user.deleteMany({
+          where: { user_link: dbUser.id },
+        });
+      } else if (requestedCompanyIds?.length > 0) {
+        const existingCompanyIds = await this.companyIdsOf(dbUser.id);
+        const companiesToAdd = requestedCompanyIds.filter(
+          (companyId) => !existingCompanyIds.includes(companyId)
+        );
+        // A client admin can only unlink companies they manage themselves.
+        const companiesToRemove = existingCompanyIds.filter(
+          (companyId) =>
+            !requestedCompanyIds.includes(companyId) &&
+            (permission.mode === "admin" || actor.companyIds.includes(companyId))
+        );
+
+        for (const companyId of companiesToAdd) {
+          await prisma.company_user.create({
+            data: {
+              user_link: dbUser.id,
+              company_link: companyId,
+            },
+          });
+        }
+
+        if (companiesToRemove.length > 0) {
+          await prisma.company_user.deleteMany({
+            where: {
+              user_link: dbUser.id,
+              company_link: { in: companiesToRemove },
+            },
+          });
+        }
+      }
+    }
+    return res.status(200).send({
+      status: 200,
+      data: this.withoutPassword(dbUser),
+      message: "user updated succesfully",
+    });
   }
   async createCompany(res, req) {
     try {
@@ -572,24 +602,55 @@ export class UserService {
         });
       }
 
-      const updatedCompany = await prisma.company.update({
-        where: { id: companyId },
-        data: {
-          name: companyName,
-          branch_name: branchName,
-          email: String(req.body.company_email ?? existingCompany.email ?? ""),
-          location: String(
-            req.body.company_location ?? existingCompany.location ?? ""
-          ),
-          gst_number: gstNumber || existingCompany.gst_number,
-          logo: String(req.body.logo ?? existingCompany.logo ?? ""),
-          service_type: serviceType,
-          amc_type: amcType,
-          start_date: serviceType ? parsedStartDate : parsedStartDate ?? undefined,
-          end_date: serviceType ? parsedEndDate : parsedEndDate ?? undefined,
-          updated_by: req.user.phone,
-        },
+      const clientAdminPlan = await this.planCompanyClientAdmin(
+        req,
+        companyId,
+        userInfo,
+        existingCompany.location,
+      );
+      if ("error" in clientAdminPlan) {
+        return res.send({ message: clientAdminPlan.error, status: clientAdminPlan.status });
+      }
+
+      const updatedCompany = await prisma.$transaction(async (tx) => {
+        if (clientAdminPlan.kind === "update") {
+          await tx.user.update({
+            where: { id: clientAdminPlan.userId },
+            data: clientAdminPlan.data,
+          });
+        } else if (clientAdminPlan.kind === "create") {
+          const admin = await tx.user.create({ data: clientAdminPlan.data });
+          await tx.company_user.create({
+            data: { company_link: companyId, user_link: admin.id },
+          });
+        }
+        return tx.company.update({
+          where: { id: companyId },
+          data: {
+            name: companyName,
+            branch_name: branchName,
+            email: String(req.body.company_email ?? existingCompany.email ?? ""),
+            location: String(
+              req.body.company_location ?? existingCompany.location ?? ""
+            ),
+            gst_number: gstNumber || existingCompany.gst_number,
+            logo: String(req.body.logo ?? existingCompany.logo ?? ""),
+            service_type: serviceType,
+            amc_type: amcType,
+            start_date: serviceType ? parsedStartDate : parsedStartDate ?? undefined,
+            end_date: serviceType ? parsedEndDate : parsedEndDate ?? undefined,
+            updated_by: req.user.phone,
+          },
+        });
       });
+
+      if (clientAdminPlan.kind === "create") {
+        try {
+          await this.notificationService.sendCredentialsEmail(clientAdminPlan.data);
+        } catch (notifyError) {
+          console.error("updateCompany credentials email failed", notifyError);
+        }
+      }
 
       return res.status(200).send({
         status: 200,
@@ -602,6 +663,115 @@ export class UserService {
         status: 204,
       });
     }
+  }
+
+  private async planCompanyClientAdmin(
+    req,
+    companyId: number,
+    userInfo,
+    companyLocation: string | null,
+  ): Promise<
+    | { kind: "none" }
+    | { kind: "update"; userId: number; data: Partial<user> }
+    | { kind: "create"; data: user }
+    | { error: string; status: number }
+  > {
+    const adminName = String(req.body.name ?? "").trim();
+    const mobile = String(req.body.phone ?? "").trim();
+    const adminEmail = String(req.body.email ?? "").trim();
+    const adminPassword = String(req.body.password ?? "").trim();
+    if (![adminName, mobile, adminEmail, adminPassword].some(Boolean)) {
+      return { kind: "none" };
+    }
+
+    const isAdmin = this.adminOrNot(userInfo?.access_level);
+    const isLinkedClientAdmin =
+      userInfo?.access_level === access_level.client_admin &&
+      this.attachedCompanyIds(userInfo).includes(companyId);
+    if (!isAdmin && !isLinkedClientAdmin) {
+      return {
+        error: "Only admins or the company's client admin can change client admin details",
+        status: HttpStatus.FORBIDDEN,
+      };
+    }
+
+    const mobileRegex = /^(\+\d{1,3}[- ]?)?\d{10}$/;
+    if (mobile && !mobileRegex.test(mobile)) {
+      return { error: "Please enter valid mobile number", status: HttpStatus.BAD_REQUEST };
+    }
+    if (adminPassword.length > 20) {
+      return { error: "Password must be at most 20 characters", status: HttpStatus.BAD_REQUEST };
+    }
+
+    const linked = await prisma.company_user.findFirst({
+      where: {
+        company_link: companyId,
+        user: { access_level: access_level.client_admin },
+      },
+      orderBy: { assigned_at: "asc" },
+      select: { user_link: true },
+    });
+    const excludeId = linked?.user_link;
+
+    if (mobile) {
+      const phoneTaken = await prisma.user.findFirst({
+        where: { phone: mobile, ...(excludeId ? { NOT: { id: excludeId } } : {}) },
+      });
+      if (phoneTaken) {
+        return {
+          error: `user already exists with phone ${phoneTaken.phone}`,
+          status: HttpStatus.NO_CONTENT,
+        };
+      }
+    }
+    if (adminEmail) {
+      const emailTaken = await prisma.user.findFirst({
+        where: {
+          email: { equals: adminEmail, mode: "insensitive" },
+          ...(excludeId ? { NOT: { id: excludeId } } : {}),
+        },
+      });
+      if (emailTaken) {
+        return { error: "This email is already used by another user", status: HttpStatus.NO_CONTENT };
+      }
+    }
+
+    if (excludeId) {
+      const data: Partial<user> = { updated_by: req.user.phone, updated_at: new Date() };
+      if (adminName) data.name = adminName;
+      if (mobile) data.phone = mobile;
+      if (adminEmail) data.email = adminEmail;
+      if (adminPassword) data.password = adminPassword;
+      return { kind: "update", userId: excludeId, data };
+    }
+
+    if (!adminName || !mobile || !adminEmail || !adminPassword) {
+      return {
+        error: "Please provide all client admin details or leave them all empty",
+        status: HttpStatus.BAD_REQUEST,
+      };
+    }
+    return {
+      kind: "create",
+      data: {
+        id: undefined,
+        name: adminName,
+        location: String(req.body.location ?? companyLocation ?? "").trim(),
+        phone: mobile,
+        email: adminEmail,
+        notes: req.body.notes,
+        password: adminPassword,
+        access_level: access_level.client_admin,
+        designation: null,
+        pan_id: "",
+        aadhaar_id: "",
+        permanent_address: "",
+        created_at: undefined,
+        created_by: req.user.phone,
+        updated_at: undefined,
+        updated_by: req.user.phone,
+      },
+    };
   }
 
   async deleteCompany(res, req) {
@@ -815,13 +985,29 @@ export class UserService {
         company_link: true,
       },
     });
+    const userInfo = await this.findOne(req.user.phone);
+    const unrestricted =
+      this.adminOrNot(userInfo?.access_level) ||
+      this.isTechnicianRole(userInfo?.access_level);
+    const ownCompanyIds = getCompanyLinks.map((x) => x.company_link);
+    if (
+      companyLink != null &&
+      companyLink !== "" &&
+      !unrestricted &&
+      !ownCompanyIds.includes(parseInt(String(companyLink), 10))
+    ) {
+      return res.send({
+        status: HttpStatus.FORBIDDEN,
+        message: "You do not have access to this company's equipment",
+      });
+    }
     let equipments;
     const includeCompany = { company: true };
     if (equipment_link || companyLink) {
       equipments = await prisma.equipment.findMany({
         where: {
           id: equipment_link ?? undefined,
-          company_link: companyLink ?? undefined,
+          company_link: companyLink ?? (unrestricted ? undefined : { in: ownCompanyIds }),
         },
         include: includeCompany,
       });
@@ -890,6 +1076,174 @@ export class UserService {
     if (userInfo.access_level === access_level.technician) return true;
     const requested = parseInt(String(companyLink ?? ""), 10);
     return this.attachedCompanyIds(userInfo).includes(requested);
+  }
+
+  withoutPassword<T>(row: T): Omit<T, "password"> {
+    if (!row || typeof row !== "object") return row as Omit<T, "password">;
+    const { password, ...rest } = row as T & { password?: unknown };
+    return rest as Omit<T, "password">;
+  }
+
+  parseCompanyIds(value): number[] {
+    const list = Array.isArray(value) ? value : value != null && value !== "" ? [value] : [];
+    return list
+      .map((id) => parseInt(String(id), 10))
+      .filter((id) => Number.isFinite(id));
+  }
+
+  private isClientRole(level): boolean {
+    return level === access_level.client || level === access_level.client_admin;
+  }
+
+  private sharesCompany(left: number[], right: number[]): boolean {
+    return left.some((id) => right.includes(id));
+  }
+
+  private createUserDecision(
+    actorLevel: access_level | undefined,
+    actorCompanyIds: number[],
+    requestedLevel: access_level,
+    requestedCompanyIds: number[],
+  ): { allowed: true; companyIds: number[] } | { allowed: false; message: string } {
+    if (this.adminOrNot(actorLevel)) {
+      if (
+        requestedLevel === access_level.eg_super_admin &&
+        actorLevel !== access_level.eg_super_admin
+      ) {
+        return { allowed: false, message: "Only a super admin can create a super admin" };
+      }
+      return { allowed: true, companyIds: requestedCompanyIds };
+    }
+    if (actorLevel === access_level.client_admin) {
+      if (!this.isClientRole(requestedLevel)) {
+        return { allowed: false, message: "Client admins can only create client or client admin users" };
+      }
+      if (actorCompanyIds.length === 0) {
+        return { allowed: false, message: "You are not linked to any company" };
+      }
+      if (requestedCompanyIds.some((id) => !actorCompanyIds.includes(id))) {
+        return { allowed: false, message: "You can only add users to your own companies" };
+      }
+      return {
+        allowed: true,
+        companyIds: requestedCompanyIds.length ? requestedCompanyIds : actorCompanyIds,
+      };
+    }
+    return { allowed: false, message: "You do not have access to create users" };
+  }
+
+  private updateUserDecision(
+    actor: { id: number; access_level: access_level; companyIds: number[] },
+    target: { id: number; access_level: access_level; companyIds: number[] },
+    requestedLevel: access_level | undefined,
+    requestedCompanyIds: number[] | undefined,
+  ): { allowed: true; mode: "admin" | "self" | "client_admin" } | { allowed: false; message: string } {
+    if (this.adminOrNot(actor.access_level)) {
+      const isSuper = actor.access_level === access_level.eg_super_admin;
+      const touchesSuper =
+        (requestedLevel === access_level.eg_super_admin && target.access_level !== access_level.eg_super_admin) ||
+        (target.access_level === access_level.eg_super_admin && requestedLevel != null && requestedLevel !== access_level.eg_super_admin);
+      if (touchesSuper && !isSuper) {
+        return { allowed: false, message: "Only a super admin can grant or revoke super admin access" };
+      }
+      return { allowed: true, mode: "admin" };
+    }
+    if (actor.id === target.id) {
+      return { allowed: true, mode: "self" };
+    }
+    if (actor.access_level === access_level.client_admin) {
+      if (!this.isClientRole(target.access_level) || !this.sharesCompany(actor.companyIds, target.companyIds)) {
+        return { allowed: false, message: "You do not have access to update this user" };
+      }
+      if (requestedLevel != null && !this.isClientRole(requestedLevel)) {
+        return { allowed: false, message: "Client admins can only assign client or client admin access" };
+      }
+      if (requestedCompanyIds?.some((id) => !actor.companyIds.includes(id))) {
+        return { allowed: false, message: "You can only link users to your own companies" };
+      }
+      return { allowed: true, mode: "client_admin" };
+    }
+    return { allowed: false, message: "You do not have access to update this user" };
+  }
+
+  private deleteUserDecision(
+    actor: { id: number; access_level: access_level; companyIds: number[] },
+    target: { id: number; access_level: access_level; companyIds: number[] },
+  ): { allowed: true } | { allowed: false; message: string } {
+    if (actor.id === target.id) {
+      return { allowed: false, message: "You cannot delete your own account" };
+    }
+    if (this.adminOrNot(actor.access_level)) {
+      if (target.access_level === access_level.eg_super_admin && actor.access_level !== access_level.eg_super_admin) {
+        return { allowed: false, message: "Only a super admin can delete a super admin" };
+      }
+      return { allowed: true };
+    }
+    if (
+      actor.access_level === access_level.client_admin &&
+      this.isClientRole(target.access_level) &&
+      this.sharesCompany(actor.companyIds, target.companyIds)
+    ) {
+      return { allowed: true };
+    }
+    return { allowed: false, message: "You do not have access to delete this user" };
+  }
+
+  private taskManageDecision(
+    actor: { id: number; access_level: access_level; companyIds: number[] },
+    raisedBy: number | null | undefined,
+    taskCompanyLink: number | null | undefined,
+  ): boolean {
+    if (this.adminOrNot(actor.access_level)) return true;
+    if (this.isTechnicianRole(actor.access_level)) return false;
+    if (raisedBy != null && raisedBy === actor.id) return true;
+    return (
+      actor.access_level === access_level.client_admin &&
+      taskCompanyLink != null &&
+      actor.companyIds.includes(taskCompanyLink)
+    );
+  }
+
+  private async taskAccessDenied(req, task, verb: "update" | "delete"): Promise<string | null> {
+    const actor = await this.loadActor(req);
+    if (!actor) return `You do not have access to ${verb} this task`;
+    if (this.isTechnicianRole(actor.access_level)) {
+      return `Service engineers cannot ${verb} tasks`;
+    }
+    const [raiser, equipment] = await Promise.all([
+      prisma.task_user.findFirst({
+        where: { task_link: task.id },
+        orderBy: [{ updated_at: "desc" }, { id: "desc" }],
+        select: { client_link: true },
+      }),
+      task.equipment_link != null
+        ? prisma.equipment.findUnique({
+            where: { id: task.equipment_link },
+            select: { company_link: true },
+          })
+        : null,
+    ]);
+    return this.taskManageDecision(actor, raiser?.client_link, equipment?.company_link)
+      ? null
+      : `You do not have access to ${verb} this task`;
+  }
+
+  private async loadActor(req) {
+    const actor = await this.findOne(req.user?.phone);
+    if (!actor) return null;
+    return {
+      id: actor.id,
+      access_level: actor.access_level,
+      companyIds: this.attachedCompanyIds(actor),
+    };
+  }
+
+  private async companyIdsOf(userId: number): Promise<number[]> {
+    const links = await prisma.company_user.findMany({
+      where: { user_link: userId },
+      select: { company_link: true },
+    });
+    return links.map((link) => link.company_link);
   }
 
   async createEquipment(res, req) {
@@ -1073,6 +1427,32 @@ export class UserService {
       if (!dbTask) {
         return res.send({ status: 204, message: "Task not found" });
       }
+      const denied = await this.taskAccessDenied(req, dbTask, "update");
+      if (denied) {
+        return res.send({ status: HttpStatus.FORBIDDEN, message: denied });
+      }
+      if (
+        req.body.equipment_link != null &&
+        parseInt(String(req.body.equipment_link), 10) !== dbTask.equipment_link
+      ) {
+        const actor = await this.loadActor(req);
+        const target = await prisma.equipment.findUnique({
+          where: { id: parseInt(String(req.body.equipment_link), 10) || -1 },
+          select: { company_link: true },
+        });
+        if (!target) {
+          return res.send({ status: 204, message: "Equipment not found" });
+        }
+        if (
+          !this.adminOrNot(actor?.access_level) &&
+          !actor?.companyIds.includes(target.company_link)
+        ) {
+          return res.send({
+            status: HttpStatus.FORBIDDEN,
+            message: "You do not have access to move this task to that equipment",
+          });
+        }
+      }
       const updated = await prisma.tasks.update({
         where: { id: taskId },
         data: {
@@ -1105,6 +1485,10 @@ export class UserService {
       if (!dbTask) {
         return res.send({ status: 204, message: "Task not found" });
       }
+      const denied = await this.taskAccessDenied(req, dbTask, "delete");
+      if (denied) {
+        return res.send({ status: HttpStatus.FORBIDDEN, message: denied });
+      }
       await prisma.hold_reason.deleteMany({ where: { task_link: taskId } });
       await prisma.images.deleteMany({ where: { taskId } });
       await prisma.task_user.deleteMany({ where: { task_link: taskId } });
@@ -1134,6 +1518,17 @@ export class UserService {
       const dbUser = await prisma.user.findUnique({ where: { id: userId } });
       if (!dbUser) {
         return res.send({ status: 204, message: "User not found" });
+      }
+      const actor = await this.loadActor(req);
+      const permission = actor
+        ? this.deleteUserDecision(actor, {
+            id: dbUser.id,
+            access_level: dbUser.access_level,
+            companyIds: await this.companyIdsOf(dbUser.id),
+          })
+        : ({ allowed: false, message: "You do not have access to delete this user" } as const);
+      if (permission.allowed === false) {
+        return res.send({ status: HttpStatus.FORBIDDEN, message: permission.message });
       }
       await prisma.company_user.deleteMany({ where: { user_link: userId } });
       await prisma.tokens.deleteMany({ where: { user_link: userId } }).catch(() => {});
@@ -2512,7 +2907,14 @@ export class UserService {
     //   }
     // });
 
+    const companyFilter = parseInt(String(req.body?.company_link ?? ""), 10);
     const filteredTasks = taskUsers.filter((task) => {
+      if (
+        Number.isFinite(companyFilter) &&
+        task.task?.equipment?.company_link !== companyFilter
+      ) {
+        return false;
+      }
       const actorId = parseInt(String(userInfo?.id ?? user.sub ?? ""), 10);
       const myTask = task.technician_link == actorId;
       const isCompanyLinked = companyLinks.includes(
@@ -2955,7 +3357,7 @@ export class UserService {
     const users = rawUsers.map(({ company_user, ...item }) => {
       const companies = company_user.map(({ company }) => company);
       return {
-        ...item,
+        ...this.withoutPassword(item),
         companies,
         company_name: companies
           .map((company) => [company.name, company.branch_name].filter(Boolean).join(" - "))
@@ -3774,8 +4176,99 @@ export class UserService {
     });
   }
 
+  private async notificationUserId(req): Promise<number> {
+    const callerId = parseInt(String(req.user.sub), 10);
+    const requested = parseInt(String(req.body?.user_link ?? ""), 10);
+    if (!Number.isFinite(requested) || requested === callerId) return callerId;
+    const caller = await this.findOne(req.user.phone);
+    return this.adminOrNot(caller?.access_level) ? requested : callerId;
+  }
+
+  async markNotificationsRead(res, req) {
+    const callerId = parseInt(String(req.user.sub), 10);
+    const ids = Array.isArray(req.body?.notification_ids)
+      ? req.body.notification_ids
+          .map((id) => parseInt(String(id), 10))
+          .filter((id) => Number.isFinite(id))
+      : [];
+    const all = req.body?.all === true || req.body?.all === "true";
+    if (!all && ids.length === 0) {
+      return res.send({
+        status: HttpStatus.BAD_REQUEST,
+        message: "Provide notification_ids or all: true",
+      });
+    }
+    const result = await prisma.notifications.updateMany({
+      where: {
+        user_link: callerId,
+        is_read: false,
+        ...(all ? {} : { id: { in: ids } }),
+      },
+      data: { is_read: true, updated_at: new Date(), updated_by: req.user.phone },
+    });
+    return res.status(200).send({
+      status: 200,
+      message: "Notifications marked as read",
+      data: { updated: result.count },
+    });
+  }
+
+  async getUnreadNotificationsCount(res, req) {
+    const count = await prisma.notifications.count({
+      where: { user_link: parseInt(String(req.user.sub), 10), is_read: false },
+    });
+    return res.status(200).send({
+      status: 200,
+      message: "Unread notifications count",
+      data: { count },
+    });
+  }
+
+  async changePassword(res, req) {
+    const currentPassword = String(req.body?.current_password ?? "");
+    const newPassword = String(req.body?.new_password ?? "");
+    if (!currentPassword || !newPassword) {
+      return res.send({
+        status: HttpStatus.BAD_REQUEST,
+        message: "current_password and new_password are required",
+      });
+    }
+    if (newPassword.length < 6 || newPassword.length > 20) {
+      return res.send({
+        status: HttpStatus.BAD_REQUEST,
+        message: "New password must be 6 to 20 characters",
+      });
+    }
+    const caller = await prisma.user.findUnique({
+      where: { id: parseInt(String(req.user.sub), 10) },
+    });
+    if (!caller) {
+      return res.send({ status: 401, message: "Please login again" });
+    }
+    if (caller.password !== currentPassword) {
+      return res.send({ status: 402, message: "current password is incorrect" });
+    }
+    await prisma.user.update({
+      where: { id: caller.id },
+      data: { password: newPassword, updated_at: new Date(), updated_by: caller.phone },
+    });
+    return res.status(200).send({ status: 200, message: "password updated" });
+  }
+
+  async getMe(res, req) {
+    const me = await this.findOne(req.user?.phone);
+    if (!me) {
+      return res.status(401).send({ status: 401, message: "Please login again" });
+    }
+    return res.status(200).send({
+      status: 200,
+      message: "user retrieved successfully",
+      data: this.withoutPassword(me),
+    });
+  }
+
   async getNotificationsByUserId(res, req) {
-    const userId = req.body.user_link ?? req.user.sub;
+    const userId = await this.notificationUserId(req);
     const notifications = await prisma.notifications.findMany({
       where: {
         user_link: userId,
@@ -3795,7 +4288,7 @@ export class UserService {
   }
 
   async getNotificationsPage(res, req) {
-    const userId = req.body.user_link ?? req.user.sub;
+    const userId = await this.notificationUserId(req);
     const rawPage = Number(req.body.page);
     const rawLimit = Number(req.body.limit);
     const page =

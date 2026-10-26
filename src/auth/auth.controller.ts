@@ -17,6 +17,11 @@ export class AuthController {
     return await this.authService.signIn(res, req);
   }
 
+  @Get('me')
+  async me(@Res() res: Response, @Req() req) {
+    return await this.userService.getMe(res, req);
+  }
+
   @Get('profile')
   async getProfile(@Res() res: Response, @Req() req) {
     return await this.userService.getAllCompanies(res, req);

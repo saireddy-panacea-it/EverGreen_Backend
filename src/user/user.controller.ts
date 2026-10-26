@@ -63,6 +63,11 @@ export class UserController {
     return await this.userService.setCompanyActive(res, req);
   }
 
+  @Post("changePassword")
+  async changePassword(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.changePassword(res, req);
+  }
+
   @Get("getAllCompanies")
   async getAllCompanies(@Res() res: Response, @Req() req: Request) {
     return await this.userService.getAllCompanies(res, req);
@@ -209,6 +214,16 @@ export class UserController {
   @Post("getNotificationsPage")
   async getNotificationsPage(@Res() res: Response, @Req() req: Request) {
     return await this.userService.getNotificationsPage(res, req);
+  }
+
+  @Post("markNotificationsRead")
+  async markNotificationsRead(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.markNotificationsRead(res, req);
+  }
+
+  @Post("getUnreadNotificationsCount")
+  async getUnreadNotificationsCount(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.getUnreadNotificationsCount(res, req);
   }
 
   @Post("upsertToken")

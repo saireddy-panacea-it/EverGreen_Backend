@@ -11,6 +11,7 @@ import {
   company,
   company_service_type,
   amc_type,
+  equipment_status,
 } from "@prisma/client";
 import * as crypto from "crypto";
 import puppeteer from "puppeteer";
@@ -83,6 +84,10 @@ export class UserService {
       updated_at: undefined,
       updated_by: req.body.phone,
       password: req.body.password,
+      is_active: true,
+      bio: null,
+      date_of_birth: null,
+      avatar_url: null,
     };
 
     const existingUser = await prisma.user.findFirst({
@@ -391,6 +396,10 @@ export class UserService {
           created_by: userPhone,
           updated_at: undefined,
           updated_by: userPhone,
+          is_active: true,
+          bio: null,
+          date_of_birth: null,
+          avatar_url: null,
         };
 
         const existingUser = await prisma.user.findFirst({ where: { phone: mobile } });
@@ -770,6 +779,10 @@ export class UserService {
         created_by: req.user.phone,
         updated_at: undefined,
         updated_by: req.user.phone,
+        is_active: true,
+        bio: null,
+        date_of_birth: null,
+        avatar_url: null,
       },
     };
   }
@@ -1307,6 +1320,11 @@ export class UserService {
           updated_by: "",
           manual: "",
           is_active: true,
+          status: equipment_status.operational,
+          type: null,
+          installed_at: null,
+          verified_at: null,
+          verified_by: null,
         };
 
         console.log(equipment);

@@ -280,6 +280,9 @@ model tasks {
   closed_at            DateTime?
   resolution_notes     String?
   rejection_reason     String?
+  contact_name         String?
+  contact_phone        String?
+  address              String?
   pm_generated         pm_generated_task[]
 
   @@unique([equipment_link, name, description, call_type], name: "tasks_equipment_link_name_description_call_type")

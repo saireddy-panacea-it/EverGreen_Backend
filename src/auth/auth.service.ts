@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { UserService } from '../user/user.service';
 import { JwtService } from '@nestjs/jwt';
 import { audit_action, audit_entity } from '@prisma/client';
+import { verifyPassword } from './password';
 
 @Injectable()
 export class AuthService {
@@ -31,11 +32,19 @@ export class AuthService {
         });
       }
 
-      if (user.password !== password) {
+      const check = await verifyPassword(password, user.password);
+      if (!check.ok) {
         return res.send({
           message: 'wrong password',
           status: 402,
         });
+      }
+      if (check.needsUpgrade) {
+        try {
+          await this.userService.storePasswordHash(user.id, password);
+        } catch (upgradeError) {
+          console.error('password hash upgrade failed during signIn', upgradeError?.message || upgradeError);
+        }
       }
 
       if (user.is_active === false) {
@@ -55,7 +64,6 @@ export class AuthService {
         }
       }
       const payload = { sub: user.id, username: user.email, phone: user.phone };
-      user.password = undefined;
       await this.userService.recordAudit(
         user,
         audit_action.logged_in,
@@ -64,7 +72,7 @@ export class AuthService {
         user.name,
       );
       return res.send({
-        data: user,
+        data: this.userService.withoutPassword(user),
         message: 'login successful',
         status: 200,
         access_token: await this.jwtService.signAsync(payload),

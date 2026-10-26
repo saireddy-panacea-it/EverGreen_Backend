@@ -19,6 +19,7 @@ import {
   audit_entity,
 } from "@prisma/client";
 import { writeAuditLog } from "../audit/audit-log";
+import { generateTemporaryPassword, hashPassword, verifyPassword } from "../auth/password";
 import * as crypto from "crypto";
 import puppeteer from "puppeteer";
 import {
@@ -94,7 +95,7 @@ export class UserService {
       created_by: req.body.phone,
       updated_at: undefined,
       updated_by: req.body.phone,
-      password: req.body.password,
+      password: req.body.password ? await hashPassword(String(req.body.password)) : req.body.password,
       is_active: true,
       bio: null,
       date_of_birth: null,
@@ -162,7 +163,7 @@ export class UserService {
       }
 
       try {
-        await this.notificationService.sendCredentialsEmail(dbUser);
+        await this.notificationService.sendCredentialsEmail({ ...dbUser, password: req.body.password });
         if (String(dbUser.access_level).toLowerCase() === "technician") {
           const actor = await this.findOne(req.user?.phone);
           await this.notificationService.onNewTechnician({
@@ -286,7 +287,7 @@ export class UserService {
       email: req.body.email ?? existingUser?.email,
       phone: req.body.phone ?? existingUser?.phone,
       updated_by: req.user?.phone ?? existingUser?.phone,
-      password: req.body.password || existingUser?.password,
+      password: req.body.password ? await hashPassword(String(req.body.password)) : undefined,
       bio: req.body.bio !== undefined ? (req.body.bio == null ? null : String(req.body.bio)) : undefined,
       date_of_birth: dateOfBirth,
       avatar_url:
@@ -456,7 +457,7 @@ export class UserService {
           phone: mobile,
           email: adminEmail,
           notes: req.body.notes,
-          password: adminPassword,
+          password: await hashPassword(adminPassword),
           access_level: access_level.client_admin,
           designation: null,
           pan_id: "",
@@ -537,8 +538,8 @@ export class UserService {
       const dbUser = created.admin;
 
       try {
-        if (dbUser?.email.trim() && dbUser.password.trim()) {
-          await this.notificationService.sendCredentialsEmail(dbUser);
+        if (dbUser?.email.trim() && adminPassword) {
+          await this.notificationService.sendCredentialsEmail({ ...dbUser, password: adminPassword });
         }
         await this.notificationService.onNewAmc({
           companyName: dbCompany.name,
@@ -729,7 +730,10 @@ export class UserService {
 
       if (clientAdminPlan.kind === "create") {
         try {
-          await this.notificationService.sendCredentialsEmail(clientAdminPlan.data);
+          await this.notificationService.sendCredentialsEmail({
+            ...clientAdminPlan.data,
+            password: String(req.body.password ?? "").trim(),
+          });
         } catch (notifyError) {
           console.error("updateCompany credentials email failed", notifyError);
         }
@@ -825,7 +829,7 @@ export class UserService {
       if (adminName) data.name = adminName;
       if (mobile) data.phone = mobile;
       if (adminEmail) data.email = adminEmail;
-      if (adminPassword) data.password = adminPassword;
+      if (adminPassword) data.password = await hashPassword(adminPassword);
       return { kind: "update", userId: excludeId, data };
     }
 
@@ -844,7 +848,7 @@ export class UserService {
         phone: mobile,
         email: adminEmail,
         notes: req.body.notes,
-        password: adminPassword,
+        password: await hashPassword(adminPassword),
         access_level: access_level.client_admin,
         designation: null,
         pan_id: "",
@@ -961,13 +965,15 @@ export class UserService {
         });
       }
 
-      const password = user.password;
+      // Stored passwords are hashes, so a new temporary one is issued; it replaces the old one only once the email is sent.
+      const password = generateTemporaryPassword();
       const name = user.name;
       const to = user.email;
       const subject = `Forgot Password`;
-      const body = `Dear ${name},\n\nYour request to reset your password has been processed. Your password is: ${password}\n\nBest regards,\nEverGreen`;
+      const body = `Dear ${name},\n\nYour request to reset your password has been processed. Your temporary password is: ${password}\n\nPlease sign in with it and change your password.\n\nBest regards,\nEverGreen`;
       const sendEmail = await this.sendEmail(to, subject, body);
       if (sendEmail) {
+        await this.storePasswordHash(user.id, password);
         return res.status(200).send({
           message: `Password sent to your registered email id: ${user.email}`,
           status: 200,
@@ -1171,6 +1177,13 @@ export class UserService {
     if (userInfo.access_level === access_level.technician) return true;
     const requested = parseInt(String(companyLink ?? ""), 10);
     return this.attachedCompanyIds(userInfo).includes(requested);
+  }
+
+  async storePasswordHash(userId: number, plain: string): Promise<void> {
+    await prisma.user.update({
+      where: { id: userId },
+      data: { password: await hashPassword(plain) },
+    });
   }
 
   withoutPassword<T>(row: T): Omit<T, "password"> {
@@ -4448,7 +4461,7 @@ export class UserService {
             location: this.excelCellText(record.admin_location) || "",
             phone: adminPhone,
             email: adminEmail,
-            password: adminPassword,
+            password: await hashPassword(adminPassword),
             access_level: access_level.client_admin,
             created_by: userPhone,
             updated_by: userPhone,
@@ -4554,7 +4567,7 @@ export class UserService {
             name,
             phone,
             email,
-            password,
+            password: await hashPassword(password),
             location: this.excelCellText(record.location) || "",
             access_level: access_level.technician,
             designation,
@@ -5035,12 +5048,12 @@ export class UserService {
     if (!caller) {
       return res.send({ status: 401, message: "Please login again" });
     }
-    if (caller.password !== currentPassword) {
+    if (!(await verifyPassword(currentPassword, caller.password)).ok) {
       return res.send({ status: 402, message: "current password is incorrect" });
     }
     await prisma.user.update({
       where: { id: caller.id },
-      data: { password: newPassword, updated_at: new Date(), updated_by: caller.phone },
+      data: { password: await hashPassword(newPassword), updated_at: new Date(), updated_by: caller.phone },
     });
     return res.status(200).send({ status: 200, message: "password updated" });
   }
@@ -5195,7 +5208,7 @@ export class UserService {
         name,
         phone,
         email,
-        password,
+        password: await hashPassword(password),
         location,
         access_level: access_level.client,
         is_active: false,

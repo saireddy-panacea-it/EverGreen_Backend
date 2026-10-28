@@ -1,6 +1,5 @@
 import { HttpStatus, Injectable, Logger } from "@nestjs/common";
 import {
-  PrismaClient,
   equipment,
   user,
   status,
@@ -39,7 +38,7 @@ import * as moment from "moment";
 var QRCode = require("qrcode");
 import { PDFDocument, rgb } from "pdf-lib";
 import fs from "fs";
-const prisma = new PrismaClient();
+import { prisma } from "../prisma";
 const SENIOR_DESIGNATION = "Senior Service Engineer";
 const JUNIOR_DESIGNATION = "Service Engineer";
 const DESIGNATION_MESSAGE = `designation must be ${SENIOR_DESIGNATION} or ${JUNIOR_DESIGNATION}`;
@@ -431,10 +430,7 @@ export class UserService {
       if (!branchName) {
         return res.send({ message: "Please enter branch name", status: HttpStatus.BAD_REQUEST });
       }
-      if (!companyAddress) {
-        return res.send({ message: "Please enter company address", status: HttpStatus.BAD_REQUEST });
-      }
-      if (!/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(gstNumber)) {
+      if (gstNumber && !/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/.test(gstNumber)) {
         return res.send({ message: "Please enter a valid GST number", status: HttpStatus.BAD_REQUEST });
       }
 
@@ -461,6 +457,23 @@ export class UserService {
         if (!mobileRegex.test(mobile)) {
           return res.send({ message: "Please enter valid mobile number", status: HttpStatus.BAD_REQUEST });
         }
+        const [existingUser, existingEmail, passwordHash] = await Promise.all([
+          prisma.user.findFirst({ where: { phone: mobile } }),
+          prisma.user.findFirst({ where: { email: { equals: adminEmail, mode: "insensitive" } } }),
+          hashPassword(adminPassword),
+        ]);
+        if (existingUser) {
+          return res.send({
+            message: `user already exists with phone ${existingUser.phone}`,
+            status: HttpStatus.NO_CONTENT,
+          });
+        }
+        if (existingEmail) {
+          return res.send({
+            message: "This email is already used by another user",
+            status: HttpStatus.NO_CONTENT,
+          });
+        }
         userData = {
           id: undefined,
           name: adminName,
@@ -468,7 +481,7 @@ export class UserService {
           phone: mobile,
           email: adminEmail,
           notes: req.body.notes,
-          password: await hashPassword(adminPassword),
+          password: passwordHash,
           access_level: access_level.client_admin,
           designation: null,
           pan_id: "",
@@ -483,23 +496,6 @@ export class UserService {
           date_of_birth: null,
           avatar_url: null,
         };
-
-        const existingUser = await prisma.user.findFirst({ where: { phone: mobile } });
-        if (existingUser) {
-          return res.send({
-            message: `user already exists with phone ${existingUser.phone}`,
-            status: HttpStatus.NO_CONTENT,
-          });
-        }
-        const existingEmail = await prisma.user.findFirst({
-          where: { email: { equals: adminEmail, mode: "insensitive" } },
-        });
-        if (existingEmail) {
-          return res.send({
-            message: "This email is already used by another user",
-            status: HttpStatus.NO_CONTENT,
-          });
-        }
       }
 
       const companyData = {
@@ -511,8 +507,8 @@ export class UserService {
         amc_type: serviceTerms.amc_type,
         start_date: serviceTerms.start_date,
         end_date: serviceTerms.end_date,
-        location: companyAddress,
-        gst_number: gstNumber,
+        location: companyAddress || null,
+        gst_number: gstNumber || null,
         logo: req.body.logo,
         created_at: undefined,
         created_by: userPhone,
@@ -553,18 +549,25 @@ export class UserService {
         if (dbUser?.email.trim() && adminPassword && this.wantsCredentialsEmail(req.body)) {
           emailSent = await this.notificationService.sendCredentialsEmail({ ...dbUser, password: adminPassword });
         }
-        await this.notificationService.onNewAmc({
-          companyName: dbCompany.name,
-          managerName: dbUser?.name ?? "No company manager assigned",
-          location: dbCompany.location,
-        });
       } catch (notifyError) {
-        console.error("createCompany notification failed", notifyError);
+        console.error("createCompany credentials email failed", notifyError);
       }
-      await this.auditFromReq(req, audit_action.created, audit_entity.amc, dbCompany.id, this.companyLabel(dbCompany));
-      if (dbUser) {
-        await this.auditFromReq(req, audit_action.created, audit_entity.user, dbUser.id, dbUser.name, "company manager for new AMC");
-      }
+      // Admin emails and audit rows do not change the response, so the caller is not kept waiting on them.
+      void (async () => {
+        try {
+          await this.notificationService.onNewAmc({
+            companyName: dbCompany.name,
+            managerName: dbUser?.name ?? "No company manager assigned",
+            location: dbCompany.location,
+          });
+        } catch (notifyError) {
+          console.error("createCompany notification failed", notifyError);
+        }
+        await this.auditFromReq(req, audit_action.created, audit_entity.amc, dbCompany.id, this.companyLabel(dbCompany));
+        if (dbUser) {
+          await this.auditFromReq(req, audit_action.created, audit_entity.user, dbUser.id, dbUser.name, "company manager for new AMC");
+        }
+      })().catch((backgroundError) => console.error("createCompany follow-up failed", backgroundError));
 
       return res.status(200).send({
         message: "company created successfully",
@@ -1056,32 +1059,30 @@ export class UserService {
       };
     }
 
-    const companies = await prisma.company.findMany({
+    const rows = await prisma.company.findMany({
       where: whereCondition,
-    });
-
-    for (const company of companies) {
-      const pocDetails = await prisma.company_user.findFirst({
-        where: {
-          user: {
-            access_level: "client_admin",
-          },
-          company_link: company.id,
-        },
-        select: {
-          user: {
-            select: {
-              name: true,
-              phone: true,
-              email: true,
-              access_level: true,
+      include: {
+        company_user: {
+          where: { user: { access_level: "client_admin" } },
+          orderBy: { user_link: "asc" },
+          take: 1,
+          select: {
+            user: {
+              select: {
+                name: true,
+                phone: true,
+                email: true,
+                access_level: true,
+              },
             },
           },
         },
-      });
-
-      company["poc_details"] = pocDetails;
-    }
+      },
+    });
+    const companies = rows.map(({ company_user, ...company }) => ({
+      ...company,
+      poc_details: company_user[0] ?? null,
+    }));
 
     return res.status(200).send({
       status: 200,
@@ -3860,11 +3861,7 @@ export class UserService {
     }
     const taskStatus = mapStatusToEnum(req.body?.status);
     const userInfo = await this.findOne(req.user.phone);
-    const companyUsers = await prisma.company_user.findMany({
-      where: {
-        user_link: userInfo.id,
-      },
-    });
+    const companyUsers = (userInfo as any)?.company_user ?? [];
 
     const isAdmin = this.adminOrNot(userInfo?.access_level) ?? false;
     const deletedOnly = isAdmin && !stats && (req.body?.deleted === true || req.body?.deleted === "true");
@@ -3976,48 +3973,29 @@ export class UserService {
       return right - left;
     });
 
-    for (let i = 0; i < filteredTasksByStatus.length; i++) {
-      if (filteredTasksByStatus[i].client_link != null) {
-        filteredTasksByStatus[i]["client"] = await prisma.user.findUnique({
-          where: { id: filteredTasksByStatus[i].client_link },
-          select: {
-            name: true,
-            id: true,
-            access_level: true,
-            phone: true,
-          },
-        });
-      } else {
-        filteredTasksByStatus[i]["client"] = undefined;
-      }
-
-      if (filteredTasksByStatus[i].technician_link != null) {
-        filteredTasksByStatus[i]["technician"] = await prisma.user.findUnique({
-          where: { id: filteredTasksByStatus[i].technician_link },
-          select: {
-            name: true,
-            id: true,
-            access_level: true,
-            phone: true,
-          },
-        });
-      } else {
-        filteredTasksByStatus[i]["technician"] = undefined;
-      }
-
-      const managerLink = filteredTasksByStatus[i].task?.manager_link;
-      filteredTasksByStatus[i]["manager"] =
-        managerLink != null
-          ? await prisma.user.findUnique({
-              where: { id: managerLink },
-              select: { name: true, id: true, access_level: true, phone: true },
-            })
-          : undefined;
-    }
-
     const statsOfTasks = this.calculateCounts(filteredTasks);
     if (stats) {
       return statsOfTasks;
+    }
+
+    const personIds = new Set<number>();
+    for (const row of filteredTasksByStatus) {
+      for (const id of [row.client_link, row.technician_link, row.task?.manager_link]) {
+        if (id != null) personIds.add(id);
+      }
+    }
+    const people = personIds.size
+      ? await prisma.user.findMany({
+          where: { id: { in: [...personIds] } },
+          select: { name: true, id: true, access_level: true, phone: true },
+        })
+      : [];
+    const personById = new Map(people.map((person) => [person.id, person]));
+    const personFor = (id) => (id != null ? personById.get(id) ?? null : undefined);
+    for (const row of filteredTasksByStatus) {
+      row["client"] = personFor(row.client_link);
+      row["technician"] = personFor(row.technician_link);
+      row["manager"] = personFor(row.task?.manager_link);
     }
     return res.send({
       data: filteredTasksByStatus,
@@ -4564,6 +4542,13 @@ export class UserService {
       const errors = [];
       const duplicates = [];
       let created = 0;
+      const activeServiceTypes = await prisma.service_type.findMany({
+        where: { is_active: true },
+        select: { id: true, name: true },
+      });
+      const serviceTypeByName = new Map(
+        activeServiceTypes.map((row) => [row.name.trim().toLowerCase(), row.id])
+      );
 
       for (const worksheet of workBook.worksheets || []) {
         const headerMap = new Map<number, string>();
@@ -4619,6 +4604,16 @@ export class UserService {
             errors.push(`Row ${rowNumber}: ${TM_FREQUENCY_MESSAGE} (got "${rawFrequency}")`);
             continue;
           }
+          const rawServiceType = this.excelCellText(record.service_type);
+          const serviceTypeLink = rawServiceType
+            ? serviceTypeByName.get(rawServiceType.trim().toLowerCase())
+            : undefined;
+          if (rawServiceType && serviceTypeLink == null) {
+            errors.push(
+              `Row ${rowNumber}: service type "${rawServiceType}" is not an active service type`
+            );
+            continue;
+          }
           const equipmentData: any = {
             name,
             make,
@@ -4631,6 +4626,7 @@ export class UserService {
             location: this.excelCellText(record.location) || "",
             description: this.excelCellText(record.description) || "",
             tm_frequency: frequency || undefined,
+            service_type_link: serviceTypeLink ?? null,
             company_link: dbCompany.id,
             created_by: "EG-Backend",
             updated_by: "EG-Backend",
@@ -5036,7 +5032,7 @@ export class UserService {
   ):
     | { error: string }
     | {
-        service_type: company_service_type;
+        service_type: company_service_type | null;
         amc_type: amc_type | null;
         start_date: Date | null;
         end_date: Date | null;
@@ -5044,12 +5040,8 @@ export class UserService {
     const serviceType = this.hasBodyValue(body.service_type)
       ? this.normalizeCompanyServiceType(body.service_type)
       : existing?.service_type ?? null;
-    if (!serviceType) {
-      return {
-        error: this.hasBodyValue(body.service_type)
-          ? "Service type must be AMC, Non-AMC or Regular"
-          : "Please select a service type",
-      };
+    if (this.hasBodyValue(body.service_type) && !serviceType) {
+      return { error: "Service type must be AMC, Non-AMC or Regular" };
     }
     if (serviceType !== company_service_type.amc) {
       return { service_type: serviceType, amc_type: null, start_date: null, end_date: null };
@@ -5058,12 +5050,8 @@ export class UserService {
     const amcType = this.hasBodyValue(body.amc_type)
       ? this.normalizeAmcType(body.amc_type)
       : existing?.amc_type ?? null;
-    if (!amcType) {
-      return {
-        error: this.hasBodyValue(body.amc_type)
-          ? "AMC type must be C AMC or NC AMC"
-          : "Please select an AMC type (C AMC or NC AMC)",
-      };
+    if (this.hasBodyValue(body.amc_type) && !amcType) {
+      return { error: "AMC type must be C AMC or NC AMC" };
     }
 
     const startDate = this.hasBodyValue(body.start_date)
@@ -5074,10 +5062,7 @@ export class UserService {
       : existing?.end_date ?? null;
     if (startDate === "invalid") return { error: "Invalid start date" };
     if (endDate === "invalid") return { error: "Invalid end date" };
-    if (!startDate || !endDate) {
-      return { error: "Start date and end date are required for AMC" };
-    }
-    if (endDate < startDate) {
+    if (startDate && endDate && endDate < startDate) {
       return { error: "End date must be on or after start date" };
     }
     return { service_type: serviceType, amc_type: amcType, start_date: startDate, end_date: endDate };
@@ -5221,10 +5206,10 @@ export class UserService {
       data?.task_link != null ? parseInt(String(data.task_link), 10) : null;
     const description = String(data?.description || title || "Notification");
 
-    for (const userId of userIds) {
+    if (userIds.length) {
       try {
-        await prisma.notifications.create({
-          data: {
+        await prisma.notifications.createMany({
+          data: userIds.map((userId) => ({
             title,
             description,
             image_url: data?.image_url || "",
@@ -5233,20 +5218,22 @@ export class UserService {
             is_read: false,
             created_by: "EG-Backend",
             updated_by: "EG-Backend",
-          },
+          })),
         });
       } catch (error) {
         console.error("Failed to persist in-app notification", error);
       }
     }
 
-    for (const token of (tokens || []).filter(Boolean)) {
-      try {
-        await this.firebaseService.sendNotification(token, title, data);
-      } catch (error) {
-        console.error("Failed to send push notification", error);
-      }
-    }
+    await Promise.all(
+      (tokens || []).filter(Boolean).map(async (token) => {
+        try {
+          await this.firebaseService.sendNotification(token, title, data);
+        } catch (error) {
+          console.error("Failed to send push notification", error);
+        }
+      }),
+    );
   }
 
   async companiesStats(res, req) {
@@ -5265,27 +5252,18 @@ export class UserService {
       months.push(now.clone().subtract(i, "months").startOf("month"));
     }
 
-    const result = [];
-
-    // Iterate through each month and get the company count
-    for (const month of months) {
+    const created = await prisma.company.findMany({
+      where: { created_at: { gte: months[months.length - 1].toDate() } },
+      select: { created_at: true },
+    });
+    const result = months.map((month) => {
       const startOfMonth = month.toDate();
       const endOfMonth = month.clone().endOf("month").toDate();
-
-      const count = await prisma.company.count({
-        where: {
-          created_at: {
-            gte: startOfMonth,
-            lt: endOfMonth,
-          },
-        },
-      });
-
-      result.push({
+      return {
         month: month.format("YYYY-MM"),
-        value: count,
-      });
-    }
+        value: created.filter((row) => row.created_at >= startOfMonth && row.created_at < endOfMonth).length,
+      };
+    });
 
     return res.status(200).send({
       status: 200,
@@ -6233,22 +6211,25 @@ export class UserService {
       return res.send({ status: HttpStatus.FORBIDDEN, message: "You do not have access to these stats" });
     }
     const thisMonth = moment.utc().startOf("month");
+    const since = thisMonth.clone().subtract(11, "months").toDate();
+    const [createdTasks, closedTasks, newCompanies, newUsers] = await Promise.all([
+      prisma.tasks.findMany({ where: { created_at: { gte: since }, deleted_at: null }, select: { created_at: true } }),
+      prisma.tasks.findMany({ where: { closed_at: { gte: since }, deleted_at: null }, select: { closed_at: true } }),
+      prisma.company.findMany({ where: { created_at: { gte: since } }, select: { created_at: true } }),
+      prisma.user.findMany({ where: { created_at: { gte: since } }, select: { created_at: true } }),
+    ]);
+    const countIn = (dates: Date[], from: Date, to: Date) => dates.filter((date) => date >= from && date < to).length;
     const months = [];
     for (let index = 0; index < 12; index++) {
       const start = thisMonth.clone().subtract(11 - index, "months");
-      const range = { gte: start.toDate(), lt: start.clone().add(1, "month").toDate() };
-      const [tasksCreated, tasksClosed, companies, users] = await Promise.all([
-        prisma.tasks.count({ where: { created_at: range, deleted_at: null } }),
-        prisma.tasks.count({ where: { closed_at: range, deleted_at: null } }),
-        prisma.company.count({ where: { created_at: range } }),
-        prisma.user.count({ where: { created_at: range } }),
-      ]);
+      const from = start.toDate();
+      const to = start.clone().add(1, "month").toDate();
       months.push({
         month: start.format("YYYY-MM"),
-        tasks_created: tasksCreated,
-        tasks_closed: tasksClosed,
-        companies,
-        users,
+        tasks_created: countIn(createdTasks.map((row) => row.created_at), from, to),
+        tasks_closed: countIn(closedTasks.map((row) => row.closed_at), from, to),
+        companies: countIn(newCompanies.map((row) => row.created_at), from, to),
+        users: countIn(newUsers.map((row) => row.created_at), from, to),
       });
     }
     return res.status(200).send({

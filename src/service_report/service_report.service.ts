@@ -1,12 +1,12 @@
 import { Injectable } from "@nestjs/common";
-import { PrismaClient, access_level } from "@prisma/client";
+import { access_level } from "@prisma/client";
 import { existsSync, mkdirSync, writeFileSync } from "fs";
 import * as moment from "moment";
 import { Prisma } from "@prisma/client";
 import { buildServiceReportPdf } from "./build_pdf";
 import { reportTimeline } from "../task_event/task-event";
 
-const prisma = new PrismaClient();
+import { prisma } from "../prisma";
 
 @Injectable()
 export class ServiceReportService {

@@ -522,19 +522,28 @@ describe('UserService', () => {
     const resolve = (body: Record<string, unknown>, existing?: any) =>
       (service as any).resolveCompanyServiceTerms(body, existing);
 
-    it('requires a service type', () => {
-      expect(resolve({})).toEqual({ error: 'Please select a service type' });
+    it('allows no service type but rejects an unknown one', () => {
+      expect(resolve({})).toEqual({ service_type: null, amc_type: null, start_date: null, end_date: null });
       expect(resolve({ service_type: 'monthly' })).toEqual({
         error: 'Service type must be AMC, Non-AMC or Regular',
       });
     });
 
-    it('requires AMC type and both dates for AMC', () => {
+    it('allows AMC without AMC type or dates but validates the ones given', () => {
       expect(resolve({ service_type: 'amc' })).toEqual({
-        error: 'Please select an AMC type (C AMC or NC AMC)',
+        service_type: 'amc',
+        amc_type: null,
+        start_date: null,
+        end_date: null,
       });
       expect(resolve({ service_type: 'AMC', amc_type: 'NC AMC', start_date: '2026-11-01' })).toEqual({
-        error: 'Start date and end date are required for AMC',
+        service_type: 'amc',
+        amc_type: 'nc_amc',
+        start_date: new Date('2026-11-01T00:00:00Z'),
+        end_date: null,
+      });
+      expect(resolve({ service_type: 'amc', amc_type: 'yearly' })).toEqual({
+        error: 'AMC type must be C AMC or NC AMC',
       });
       expect(
         resolve({ service_type: 'amc', amc_type: 'c_amc', start_date: '2026-11-01', end_date: '2026-10-01' }),
@@ -1034,9 +1043,19 @@ describe('UserService', () => {
       { id: 1, technician_link: 7, client_link: 5, status: 'open', task: { id: 41, equipment: null, equipment_link: null, contact_name: 'Ravi', image: [], manager_link: null, created_at: new Date('2026-10-02') } },
       { id: 2, technician_link: null, client_link: 9, status: 'open', task: { id: 42, equipment: { company_link: 3, company: { name: 'Acme' } }, equipment_link: 8, image: [{ url: 'x.png' }], manager_link: null, created_at: new Date('2026-10-01') } },
     ];
+    const people = [
+      { id: 5, name: 'Asha', access_level: 'eg_admin', phone: '1' },
+      { id: 7, name: 'Kiran', access_level: 'technician', phone: '2' },
+      { id: 9, name: 'Meena', access_level: 'client_admin', phone: '3' },
+    ];
     const listAs = async (access_level: string, id: number, companies: number[] = []) => {
-      jest.spyOn(service, 'findOne').mockResolvedValue({ id, access_level, designation: null, company_user: [] } as any);
-      db('company_user').findMany.mockResolvedValue(companies.map((company_link) => ({ company_link })));
+      jest.spyOn(service, 'findOne').mockResolvedValue({
+        id,
+        access_level,
+        designation: null,
+        company_user: companies.map((company_link) => ({ company_link })),
+      } as any);
+      db('user').findMany.mockResolvedValue(people);
       mockPrisma.$queryRaw = jest.fn().mockResolvedValue(rows.map(({ id }) => ({ id })));
       db('task_user').findMany.mockResolvedValue(rows);
       const res = mockRes();
@@ -1054,6 +1073,8 @@ describe('UserService', () => {
       const out = await listAs('eg_admin', 5);
       expect(out.data.map((row) => row.task.id)).toEqual([41, 42]);
       expect(out.data[0].task).toMatchObject({ equipment: null, contact_name: 'Ravi', image: [] });
+      expect(out.data[0]).toMatchObject({ technician: { id: 7, name: 'Kiran' }, client: { id: 5, name: 'Asha' }, manager: undefined });
+      expect(db('user').findMany).toHaveBeenCalledTimes(1);
     });
 
     it('shows an individual task to its assigned service engineer only', async () => {
@@ -1077,7 +1098,7 @@ describe('UserService', () => {
 
     it('drops individual tasks when filtering by company', async () => {
       jest.spyOn(service, 'findOne').mockResolvedValue({ id: 5, access_level: 'eg_admin', company_user: [] } as any);
-      db('company_user').findMany.mockResolvedValue([]);
+      db('user').findMany.mockResolvedValue(people);
       mockPrisma.$queryRaw = jest.fn().mockResolvedValue([{ id: 1 }, { id: 2 }]);
       db('task_user').findMany.mockResolvedValue(rows);
       const res = mockRes();
@@ -1378,6 +1399,7 @@ describe('UserService bulk uploads and TM frequency', () => {
   it('uploads equipment with normalized frequencies and reports unknown ones per row', async () => {
     asUser('eg_admin');
     db('company').findUnique.mockResolvedValue({ id: 3 });
+    db('service_type').findMany.mockResolvedValue([]);
     const file = await equipmentSheet(['Quarterly', 'Bi-Monthly', 'Sometimes', 'half yearly', '']);
     const res = mockRes();
     await service.uploadEquipmentData(res, { user: { phone: 'p' }, body: { company_link: '3' } }, file);
@@ -1392,6 +1414,24 @@ describe('UserService bulk uploads and TM frequency', () => {
       'semi_annual',
       undefined,
     ]);
+  });
+
+  it('links uploaded equipment to service types by name and reports unknown ones', async () => {
+    asUser('eg_admin');
+    db('company').findUnique.mockResolvedValue({ id: 3 });
+    db('service_type').findMany.mockResolvedValue([{ id: 4, name: 'Refrigeration' }]);
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Equipment');
+    sheet.addRow(['Name', 'Make', 'Model', 'Service Type']);
+    sheet.addRow(['Fridge', 'LG', 'M1', ' refrigeration ']);
+    sheet.addRow(['AC', 'LG', 'M2', 'Plumbing']);
+    sheet.addRow(['Oven', 'LG', 'M3', '']);
+    const res = mockRes();
+    await service.uploadEquipmentData(res, { user: { phone: 'p' }, body: { company_link: '3' } }, {
+      buffer: Buffer.from(await workbook.xlsx.writeBuffer()),
+    });
+    expect(sent(res).errors).toEqual(['Row 3: service type "Plumbing" is not an active service type']);
+    expect(db('equipment').create.mock.calls.map((call) => call[0].data.service_type_link)).toEqual([4, null]);
   });
 
   it('validates tm_frequency on createEquipment', async () => {

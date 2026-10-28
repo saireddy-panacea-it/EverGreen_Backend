@@ -1,6 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
 import {
-  PrismaClient,
   access_level,
   approval_state,
   audit_action,
@@ -11,8 +10,7 @@ import * as nodemailer from 'nodemailer';
 import { FirebaseService } from '../firebase/firebase.service';
 import { writeAuditLog } from '../audit/audit-log';
 import { writeTaskEvent } from '../task_event/task-event';
-
-const prisma = new PrismaClient();
+import { prisma } from '../prisma';
 
 export const ROLE = {
   ADMIN: access_level.eg_super_admin,
@@ -156,45 +154,47 @@ export class NotificationService {
 
     const payload = this.asStringData({ title, ...data });
 
-    for (const userId of ids) {
-      try {
-        await prisma.notifications.create({
-          data: {
-            title,
-            description: payload.description || title,
-            image_url: payload.image_url || null,
-            task_link: payload.task_link
-              ? parseInt(payload.task_link, 10)
-              : null,
-            user_link: userId,
-            is_read: false,
-            created_by: 'EG-Backend',
-            updated_by: 'EG-Backend',
-          },
-        });
-      } catch (error) {
-        this.logger.error(
-          `Failed to persist notification for user ${userId}: ${error?.message || error}`,
-        );
-      }
-
-      try {
-        const tokens = await prisma.tokens.findMany({
-          where: { user_link: userId },
-          select: { fcm_id: true },
-        });
-        const fcmIds = tokens.map((row) => row.fcm_id).filter(Boolean);
-        await Promise.all(
-          fcmIds.map((token) =>
-            this.firebaseService.sendNotification(token, title, payload),
-          ),
-        );
-      } catch (error) {
-        this.logger.error(
-          `Failed to push to user ${userId}: ${error?.message || error}`,
-        );
-      }
+    try {
+      await prisma.notifications.createMany({
+        data: ids.map((userId) => ({
+          title,
+          description: payload.description || title,
+          image_url: payload.image_url || null,
+          task_link: payload.task_link ? parseInt(payload.task_link, 10) : null,
+          user_link: userId,
+          is_read: false,
+          created_by: 'EG-Backend',
+          updated_by: 'EG-Backend',
+        })),
+      });
+    } catch (error) {
+      this.logger.error(
+        `Failed to persist notifications for users ${ids.join(', ')}: ${error?.message || error}`,
+      );
     }
+
+    let tokens: { user_link: number; fcm_id: string | null }[] = [];
+    try {
+      tokens = await prisma.tokens.findMany({
+        where: { user_link: { in: ids } },
+        select: { user_link: true, fcm_id: true },
+      });
+    } catch (error) {
+      this.logger.error(`Failed to load push tokens: ${error?.message || error}`);
+    }
+    await Promise.all(
+      tokens
+        .filter((row) => row.fcm_id)
+        .map(async (row) => {
+          try {
+            await this.firebaseService.sendNotification(row.fcm_id, title, payload);
+          } catch (error) {
+            this.logger.error(
+              `Failed to push to user ${row.user_link}: ${error?.message || error}`,
+            );
+          }
+        }),
+    );
   }
 
   async pushToLevels(

@@ -188,6 +188,26 @@ export class UserController {
     return await this.userService.deleteTask(res, req);
   }
 
+  @Post("getActiveTaskForEquipment")
+  async getActiveTaskForEquipment(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.getActiveTaskForEquipment(res, req);
+  }
+
+  @Post("getIssueTypes")
+  async getIssueTypes(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.getIssueTypes(res, req);
+  }
+
+  @Post("createIssueType")
+  async createIssueType(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.createIssueType(res, req);
+  }
+
+  @Post("updateIssueType")
+  async updateIssueType(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.updateIssueType(res, req);
+  }
+
   @Post("deleteUser")
   async deleteUser(@Res() res: Response, @Req() req: Request) {
     return await this.userService.deleteUser(res, req);

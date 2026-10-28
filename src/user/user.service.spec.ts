@@ -807,6 +807,174 @@ describe('UserService', () => {
     });
   });
 
+  describe('deleteTask (soft delete)', () => {
+    const actorAs = (access_level: string) =>
+      jest.spyOn(service, 'findOne').mockResolvedValue({ id: 5, name: 'Asha', phone: 'p', access_level, company_user: [] } as any);
+    const task = (status: string, extra = {}) => ({
+      id: 41,
+      ticket_no: 'TKT1',
+      name: 'AC not cooling',
+      deleted_at: null,
+      equipment: { company_link: 3 },
+      task_user: [{ id: 9, status, client_link: 20, technician_link: 30 }],
+      ...extra,
+    });
+    const del = async (body) => {
+      const res = mockRes();
+      await service.deleteTask(res, { user: { phone: 'p' }, body });
+      return sent(res);
+    };
+
+    beforeEach(() => {
+      notifications.pushToUsers = jest.fn();
+      notifications.taskPayload = jest.fn(() => ({}));
+    });
+
+    it('allows only super admins and managers', async () => {
+      for (const level of ['client', 'client_admin', 'technician']) {
+        actorAs(level);
+        expect(await del({ task_link: 41, reason: 'dup' })).toEqual({ status: 403, message: 'Only admins and managers can delete tasks' });
+      }
+      expect(db('tasks').update).not.toHaveBeenCalled();
+    });
+
+    it('requires a reason', async () => {
+      actorAs('eg_admin');
+      expect(await del({ task_link: 41, reason: '   ' })).toEqual({ status: 400, message: 'A reason is required to delete a task' });
+    });
+
+    it('refuses tasks that are started, closed or already deleted', async () => {
+      actorAs('eg_super_admin');
+      for (const status of ['in_progress', 'hold', 'completed', 'closed']) {
+        db('tasks').findUnique.mockResolvedValue(task(status));
+        expect((await del({ task_link: 41, reason: 'dup' })).status).toBe(409);
+      }
+      db('tasks').findUnique.mockResolvedValue(task('open', { deleted_at: new Date() }));
+      expect(await del({ task_link: 41, reason: 'dup' })).toEqual({ status: 204, message: 'Task not found' });
+      expect(db('tasks').update).not.toHaveBeenCalled();
+    });
+
+    it('marks the task deleted and notifies the POC, client admins and engineer', async () => {
+      actorAs('eg_admin');
+      db('tasks').findUnique.mockResolvedValue(task('open'));
+      db('tasks').update.mockResolvedValue({ id: 41, deleted_at: new Date() });
+      db('company_user').findMany.mockResolvedValue([{ user_link: 21 }, { user_link: 22 }]);
+      const out = await del({ task_link: 41, reason: '  Raised twice  ' });
+
+      expect(out).toMatchObject({ status: 200, message: 'Task deleted successfully' });
+      expect(db('tasks').update.mock.calls[0][0]).toMatchObject({
+        where: { id: 41 },
+        data: { deleted_by: 5, delete_reason: 'Raised twice' },
+      });
+      expect(db('tasks').delete).not.toHaveBeenCalled();
+      const [userIds, title, , excluded] = notifications.pushToUsers.mock.calls[0];
+      expect(userIds).toEqual([20, 30, 21, 22]);
+      expect(title).toBe('Ticket deleted');
+      expect(excluded).toBe(5);
+      expect(notifications.taskPayload.mock.calls[0][1].description).toContain('Reason: Raised twice');
+    });
+  });
+
+  describe('one active task per equipment', () => {
+    const asClient = () =>
+      jest.spyOn(service, 'findOne').mockResolvedValue({ id: 20, phone: 'p', access_level: 'client', company_user: [] } as any);
+
+    it('finds the latest unclosed, undeleted task', async () => {
+      db('tasks').findMany.mockResolvedValue([
+        { id: 3, ticket_no: 'C', name: 'closed', task_user: [{ status: 'closed' }] },
+        { id: 2, ticket_no: 'B', name: 'waiting', task_user: [{ status: 'completed' }] },
+      ]);
+      expect(await service.activeTaskForEquipment(8)).toEqual({ id: 2, ticket_no: 'B', name: 'waiting', status: 'completed' });
+      expect(db('tasks').findMany.mock.calls[0][0].where).toEqual({ equipment_link: 8, deleted_at: null });
+    });
+
+    it('refuses to raise a second task on the same equipment', async () => {
+      asClient();
+      db('equipment').findUnique.mockResolvedValue({ id: 8, company_link: 3, company: {} });
+      db('tasks').findMany.mockResolvedValue([{ id: 2, ticket_no: 'B', name: 'x', task_user: [{ status: 'open' }] }]);
+      const res = mockRes();
+      await service.createTask(res, { user: { phone: 'p' }, body: { equipment_link: 8, name: 'n', description: 'd', call_type: 'service' } });
+      expect(sent(res)).toMatchObject({ status: 409, data: { ticket_no: 'B' } });
+      expect(sent(res).message).toContain('Ticket B');
+      expect(db('tasks').create).not.toHaveBeenCalled();
+    });
+
+    it('raises a task once the earlier one is closed, with issue type and location', async () => {
+      asClient();
+      db('equipment').findUnique.mockResolvedValue({ id: 8, company_link: 3, company: {} });
+      db('tasks').findMany.mockResolvedValue([{ id: 2, ticket_no: 'B', name: 'x', task_user: [{ status: 'closed' }] }]);
+      db('issue_type').findUnique.mockResolvedValue({ id: 7, name: 'Gas refill', call_type: null, is_active: true });
+      db('tasks').create.mockResolvedValue({ id: 50, ticket_no: 'N' });
+      const res = mockRes();
+      await service.createTask(res, {
+        user: { phone: 'p' },
+        body: { equipment_link: 8, name: 'n', description: 'd', issue_type_link: 7, location: ' Block B, 2nd floor ', client_link: 20 },
+      });
+      expect(db('tasks').create.mock.calls[0][0].data).toMatchObject({ issue_type_link: 7, location: 'Block B, 2nd floor' });
+      expect(db('tasks').create.mock.calls[0][0].data.call_type).toBeUndefined();
+      expect(sent(res).status).toBe(200);
+    });
+  });
+
+  describe('resolveIssueType', () => {
+    it('rejects an unknown or inactive issue type', async () => {
+      db('issue_type').findUnique.mockResolvedValue({ id: 7, is_active: false });
+      expect(await service.resolveIssueType({ issue_type_link: 7 })).toEqual({ error: 'issue_type_link must be an active issue type' });
+    });
+
+    it('links a legacy call_type to its built-in issue type', async () => {
+      db('issue_type').findFirst.mockResolvedValue({ id: 2 });
+      expect(await service.resolveIssueType({ call_type: 'Breakdown' })).toEqual({ issue_type_link: 2, call_type: 'breakdown' });
+      expect(await service.resolveIssueType({})).toEqual({ issue_type_link: null, call_type: null });
+    });
+  });
+
+  describe('issue type management', () => {
+    const as = (access_level: string) =>
+      jest.spyOn(service, 'findOne').mockResolvedValue({ id: 5, name: 'A', phone: 'p', access_level, company_user: [] } as any);
+    const call = async (fn: 'createIssueType' | 'updateIssueType', body) => {
+      const res = mockRes();
+      await service[fn](res, { user: { phone: 'p' }, body });
+      return sent(res);
+    };
+
+    it('is limited to super admins and managers', async () => {
+      as('client_admin');
+      expect((await call('createIssueType', { name: 'Gas refill' })).status).toBe(403);
+      as('technician');
+      expect((await call('updateIssueType', { issue_type_link: 1, is_active: false })).status).toBe(403);
+    });
+
+    it('creates a trimmed, case-insensitively unique name', async () => {
+      as('eg_admin');
+      db('issue_type').findFirst.mockResolvedValue({ id: 1 });
+      expect((await call('createIssueType', { name: 'breakdown' })).status).toBe(409);
+
+      db('issue_type').findFirst.mockResolvedValue(null);
+      db('issue_type').create.mockResolvedValue({ id: 9, name: 'Gas refill' });
+      expect((await call('createIssueType', { name: '  Gas   refill ' })).status).toBe(200);
+      expect(db('issue_type').create.mock.calls[0][0].data.name).toBe('Gas refill');
+    });
+
+    it('renames or deactivates an issue type', async () => {
+      as('eg_super_admin');
+      db('issue_type').findUnique.mockResolvedValue({ id: 9, name: 'Gas refill' });
+      db('issue_type').update.mockResolvedValue({ id: 9, name: 'Gas refill', is_active: false });
+      expect((await call('updateIssueType', { issue_type_link: 9, is_active: 'no' })).status).toBe(400);
+      expect((await call('updateIssueType', { issue_type_link: 9, is_active: false })).status).toBe(200);
+      expect(db('issue_type').update.mock.calls[0][0].data).toMatchObject({ is_active: false });
+    });
+  });
+
+  describe('wantsCredentialsEmail', () => {
+    it('emails unless send_credentials is false', () => {
+      expect(service.wantsCredentialsEmail({})).toBe(true);
+      expect(service.wantsCredentialsEmail({ send_credentials: true })).toBe(true);
+      expect(service.wantsCredentialsEmail({ send_credentials: false })).toBe(false);
+      expect(service.wantsCredentialsEmail({ send_credentials: 'false' })).toBe(false);
+    });
+  });
+
   describe('getAllTasks with individual tasks', () => {
     const rows = [
       { id: 1, technician_link: 7, client_link: 5, status: 'open', task: { id: 41, equipment: null, equipment_link: null, contact_name: 'Ravi', image: [], manager_link: null, created_at: new Date('2026-10-02') } },
@@ -837,6 +1005,20 @@ describe('UserService', () => {
     it('shows an individual task to its assigned service engineer only', async () => {
       expect((await listAs('technician', 7)).data.map((row) => row.task.id)).toEqual([41]);
       expect((await listAs('technician', 8)).data).toEqual([]);
+    });
+
+    it('hides deleted tasks; admins can list only deleted ones', async () => {
+      await listAs('eg_admin', 5);
+      expect(db('task_user').findMany.mock.calls[0][0].where.task).toEqual({ deleted_at: null });
+
+      jest.spyOn(service, 'findOne').mockResolvedValue({ id: 5, access_level: 'eg_admin', company_user: [] } as any);
+      const res = mockRes();
+      await service.getAllTasks(res, { user: { phone: 'p', sub: 5 }, body: { deleted: true } });
+      expect(db('task_user').findMany.mock.calls[1][0].where.task).toEqual({ deleted_at: { not: null } });
+
+      jest.spyOn(service, 'findOne').mockResolvedValue({ id: 9, access_level: 'client_admin', company_user: [] } as any);
+      await service.getAllTasks(mockRes(), { user: { phone: 'p', sub: 9 }, body: { deleted: true } });
+      expect(db('task_user').findMany.mock.calls[2][0].where.task).toEqual({ deleted_at: null });
     });
 
     it('drops individual tasks when filtering by company', async () => {

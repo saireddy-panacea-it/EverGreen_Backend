@@ -49,6 +49,8 @@ const TASK_DELETE_REASON_MAX = 500;
 const TASK_LOCATION_MAX = 200;
 const TASK_LOCATION_MESSAGE = `location must be at most ${TASK_LOCATION_MAX} characters`;
 const ISSUE_TYPE_NAME_MAX = 60;
+
+type ManagedTypeKind = "issue_type" | "service_type";
 import nodemailer from "nodemailer";
 import { FirebaseService } from "../firebase/firebase.service"; // Update the import path as necessary
 import { NotificationService, taskPlaceLabel } from "../notification/notification.service";
@@ -1129,7 +1131,7 @@ export class UserService {
       }
     }
     let equipments;
-    const includeCompany = { company: true };
+    const includeCompany = { company: true, service_type: { select: { id: true, name: true } } };
     if (equipment_link || companyLink) {
       equipments = await prisma.equipment.findMany({
         where: {
@@ -1729,6 +1731,10 @@ export class UserService {
       if (this.hasBodyValue(req.body.tm_frequency) && !tmFrequency) {
         return res.send({ status: HttpStatus.BAD_REQUEST, message: TM_FREQUENCY_MESSAGE });
       }
+      const serviceTypeLink = await this.resolveServiceTypeLink(req.body);
+      if (serviceTypeLink.error) {
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: serviceTypeLink.error });
+      }
 
       if (dbCompany != null) {
         const equipment: equipment = {
@@ -1756,6 +1762,7 @@ export class UserService {
           installed_at: installedAt ?? null,
           verified_at: null,
           verified_by: null,
+          service_type_link: serviceTypeLink.link ?? null,
         };
 
         console.log(equipment);
@@ -1830,6 +1837,10 @@ export class UserService {
       if (this.hasBodyValue(req.body.tm_frequency) && !tmFrequency) {
         return res.send({ status: HttpStatus.BAD_REQUEST, message: TM_FREQUENCY_MESSAGE });
       }
+      const serviceTypeLink = await this.resolveServiceTypeLink(req.body, dbEquipment.service_type_link);
+      if (serviceTypeLink.error) {
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: serviceTypeLink.error });
+      }
 
       // Update equipment
       const updatedEquipment = await prisma.equipment.update({
@@ -1857,6 +1868,7 @@ export class UserService {
           status: equipmentStatus,
           type: req.body.type !== undefined ? (this.hasBodyValue(req.body.type) ? String(req.body.type).trim() : null) : undefined,
           installed_at: installedAt,
+          service_type_link: serviceTypeLink.link,
         },
       });
 
@@ -2542,19 +2554,26 @@ export class UserService {
     });
   }
 
-  async getIssueTypes(res, req) {
+  /** Admin-managed name lists: issue types (tasks) and service types (equipment). */
+  private managedType(kind: ManagedTypeKind) {
+    return kind === "issue_type"
+      ? { delegate: prisma.issue_type as any, entity: audit_entity.issue_type, label: "Issue type", plural: "issue types", linkKey: "issue_type_link" }
+      : { delegate: prisma.service_type as any, entity: audit_entity.service_type, label: "Service type", plural: "service types", linkKey: "service_type_link" };
+  }
+
+  private async listManagedTypes(kind: ManagedTypeKind, res, req) {
     const userInfo = await this.findOne(req.user?.phone);
     const includeInactive =
       this.adminOrNot(userInfo?.access_level) &&
       (req.body?.include_inactive === true || req.body?.include_inactive === "true");
-    const rows = await prisma.issue_type.findMany({
+    const rows = await this.managedType(kind).delegate.findMany({
       where: includeInactive ? {} : { is_active: true },
       orderBy: { id: "asc" },
     });
     return res.status(200).send({ status: 200, data: rows, message: "ok" });
   }
 
-  private parseIssueTypeName(value: unknown): string | { error: string } {
+  private parseManagedTypeName(value: unknown): string | { error: string } {
     const name = String(value ?? "").trim().replace(/\s+/g, " ");
     if (!name) return { error: "name is required" };
     if (name.length > ISSUE_TYPE_NAME_MAX) {
@@ -2563,8 +2582,8 @@ export class UserService {
     return name;
   }
 
-  private async issueTypeNameTaken(name: string, exceptId?: number): Promise<boolean> {
-    const row = await prisma.issue_type.findFirst({
+  private async managedTypeNameTaken(kind: ManagedTypeKind, name: string, exceptId?: number): Promise<boolean> {
+    const row = await this.managedType(kind).delegate.findFirst({
       where: {
         name: { equals: name, mode: "insensitive" },
         ...(exceptId != null ? { id: { not: exceptId } } : {}),
@@ -2574,46 +2593,48 @@ export class UserService {
     return row != null;
   }
 
-  async createIssueType(res, req) {
+  private async createManagedType(kind: ManagedTypeKind, res, req) {
+    const type = this.managedType(kind);
     const actor = await this.loadActor(req);
     if (!actor || !this.adminOrNot(actor.access_level)) {
-      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and managers can manage issue types" });
+      return res.send({ status: HttpStatus.FORBIDDEN, message: `Only admins and managers can manage ${type.plural}` });
     }
-    const name = this.parseIssueTypeName(req.body?.name);
+    const name = this.parseManagedTypeName(req.body?.name);
     if (typeof name !== "string") {
       return res.send({ status: HttpStatus.BAD_REQUEST, message: name.error });
     }
-    if (await this.issueTypeNameTaken(name)) {
-      return res.send({ status: HttpStatus.CONFLICT, message: `Issue type "${name}" already exists` });
+    if (await this.managedTypeNameTaken(kind, name)) {
+      return res.send({ status: HttpStatus.CONFLICT, message: `${type.label} "${name}" already exists` });
     }
-    const created = await prisma.issue_type.create({
+    const created = await type.delegate.create({
       data: { name, created_by: req.user?.phone, updated_by: req.user?.phone },
     });
-    await this.recordAudit(actor, audit_action.created, audit_entity.issue_type, created.id, created.name, "created");
-    return res.status(200).send({ status: 200, data: created, message: "Issue type created" });
+    await this.recordAudit(actor, audit_action.created, type.entity, created.id, created.name, "created");
+    return res.status(200).send({ status: 200, data: created, message: `${type.label} created` });
   }
 
-  async updateIssueType(res, req) {
+  private async updateManagedType(kind: ManagedTypeKind, res, req) {
+    const type = this.managedType(kind);
     const actor = await this.loadActor(req);
     if (!actor || !this.adminOrNot(actor.access_level)) {
-      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and managers can manage issue types" });
+      return res.send({ status: HttpStatus.FORBIDDEN, message: `Only admins and managers can manage ${type.plural}` });
     }
-    const id = parseInt(String(req.body?.issue_type_link ?? ""), 10);
-    const existing = Number.isFinite(id) ? await prisma.issue_type.findUnique({ where: { id } }) : null;
+    const id = parseInt(String(req.body?.[type.linkKey] ?? ""), 10);
+    const existing = Number.isFinite(id) ? await type.delegate.findUnique({ where: { id } }) : null;
     if (!existing) {
-      return res.send({ status: 204, message: "Issue type not found" });
+      return res.send({ status: 204, message: `${type.label} not found` });
     }
     const data: { name?: string; is_active?: boolean; updated_at: Date; updated_by?: string } = {
       updated_at: new Date(),
       updated_by: req.user?.phone,
     };
     if (req.body?.name !== undefined) {
-      const name = this.parseIssueTypeName(req.body.name);
+      const name = this.parseManagedTypeName(req.body.name);
       if (typeof name !== "string") {
         return res.send({ status: HttpStatus.BAD_REQUEST, message: name.error });
       }
-      if (await this.issueTypeNameTaken(name, id)) {
-        return res.send({ status: HttpStatus.CONFLICT, message: `Issue type "${name}" already exists` });
+      if (await this.managedTypeNameTaken(kind, name, id)) {
+        return res.send({ status: HttpStatus.CONFLICT, message: `${type.label} "${name}" already exists` });
       }
       data.name = name;
     }
@@ -2623,9 +2644,48 @@ export class UserService {
       }
       data.is_active = req.body.is_active;
     }
-    const updated = await prisma.issue_type.update({ where: { id }, data });
-    await this.recordAudit(actor, audit_action.updated, audit_entity.issue_type, updated.id, updated.name, JSON.stringify({ name: data.name, is_active: data.is_active }));
-    return res.status(200).send({ status: 200, data: updated, message: "Issue type updated" });
+    const updated = await type.delegate.update({ where: { id }, data });
+    await this.recordAudit(actor, audit_action.updated, type.entity, updated.id, updated.name, JSON.stringify({ name: data.name, is_active: data.is_active }));
+    return res.status(200).send({ status: 200, data: updated, message: `${type.label} updated` });
+  }
+
+  async getIssueTypes(res, req) {
+    return this.listManagedTypes("issue_type", res, req);
+  }
+
+  async createIssueType(res, req) {
+    return this.createManagedType("issue_type", res, req);
+  }
+
+  async updateIssueType(res, req) {
+    return this.updateManagedType("issue_type", res, req);
+  }
+
+  async getServiceTypes(res, req) {
+    return this.listManagedTypes("service_type", res, req);
+  }
+
+  async createServiceType(res, req) {
+    return this.createManagedType("service_type", res, req);
+  }
+
+  async updateServiceType(res, req) {
+    return this.updateManagedType("service_type", res, req);
+  }
+
+  /**
+   * `service_type_link` from an equipment create / update body: undefined
+   * when absent (keep the current one), null to clear, else the id of an
+   * active service type (the equipment's current one may be inactive).
+   */
+  async resolveServiceTypeLink(body, currentLink: number | null = null): Promise<{ link?: number | null; error?: string }> {
+    if (body?.service_type_link === undefined) return { link: undefined };
+    if (!this.hasBodyValue(body.service_type_link)) return { link: null };
+    const id = parseInt(String(body.service_type_link), 10);
+    if (Number.isFinite(id) && id === currentLink) return { link: id };
+    const row = Number.isFinite(id) ? await prisma.service_type.findUnique({ where: { id } }) : null;
+    if (!row || !row.is_active) return { error: "service_type_link must be an active service type" };
+    return { link: row.id };
   }
 
   generateOtp(): string {
@@ -3130,7 +3190,7 @@ export class UserService {
     let equipment = Number.isFinite(asNumber) && asNumber > 0
       ? await prisma.equipment.findUnique({
           where: { id: asNumber },
-          include: { company: true },
+          include: { company: true, service_type: { select: { id: true, name: true } } },
         })
       : null;
     if (!equipment && rawLink != null && String(rawLink).trim() !== "") {
@@ -3141,7 +3201,7 @@ export class UserService {
             { serial_number: String(rawLink).trim() },
           ],
         },
-        include: { company: true },
+        include: { company: true, service_type: { select: { id: true, name: true } } },
       });
     }
     if (!equipment) {
@@ -3857,6 +3917,7 @@ export class UserService {
             equipment: {
               include: {
                 company: true,
+                service_type: { select: { id: true, name: true } },
               },
             },
             hold_reason: {

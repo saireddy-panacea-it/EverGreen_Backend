@@ -213,6 +213,21 @@ export class UserController {
     return await this.userService.updateIssueType(res, req);
   }
 
+  @Post("getServiceTypes")
+  async getServiceTypes(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.getServiceTypes(res, req);
+  }
+
+  @Post("createServiceType")
+  async createServiceType(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.createServiceType(res, req);
+  }
+
+  @Post("updateServiceType")
+  async updateServiceType(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.updateServiceType(res, req);
+  }
+
   @Post("deleteUser")
   async deleteUser(@Res() res: Response, @Req() req: Request) {
     return await this.userService.deleteUser(res, req);

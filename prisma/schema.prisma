@@ -208,6 +208,7 @@ enum audit_entity {
   equipment
   auth
   issue_type
+  service_type
 }
 
 model equipment {
@@ -239,6 +240,8 @@ model equipment {
   verified_by       Int?
   verifier          user?         @relation("equipment_verifier", fields: [verified_by], references: [id], onDelete: SetNull)
   pm_schedules      pm_schedule[]
+  service_type_link Int?
+  service_type      service_type? @relation(fields: [service_type_link], references: [id], onDelete: SetNull)
 
   @@unique([eg_serial_number, make, model], name: "equipment_eg_serial_number_make_model")
 }
@@ -329,6 +332,17 @@ model issue_type {
   updated_at DateTime   @default(now())
   updated_by String?
   tasks      tasks[]
+}
+
+model service_type {
+  id         Int         @id @default(autoincrement())
+  name       String      @unique @db.VarChar(60)
+  is_active  Boolean     @default(true)
+  created_at DateTime    @default(now())
+  created_by String?
+  updated_at DateTime    @default(now())
+  updated_by String?
+  equipments equipment[]
 }
 
 model images {

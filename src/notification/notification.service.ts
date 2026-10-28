@@ -285,9 +285,9 @@ EverGreen`;
       case ROLE.TECHNICIAN:
         return 'Service Engineer';
       case ROLE.AMC_MANAGER:
-        return 'AMC Manager';
+        return 'Company Manager';
       case ROLE.CLIENT:
-        return 'Client';
+        return 'POC';
       default:
         return level || 'User';
     }

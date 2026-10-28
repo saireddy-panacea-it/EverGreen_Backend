@@ -966,6 +966,59 @@ describe('UserService', () => {
     });
   });
 
+  describe('service type management', () => {
+    const as = (access_level: string) =>
+      jest.spyOn(service, 'findOne').mockResolvedValue({ id: 5, name: 'A', phone: 'p', access_level, company_user: [] } as any);
+    const call = async (fn: 'createServiceType' | 'updateServiceType' | 'getServiceTypes', body) => {
+      const res = mockRes();
+      await service[fn](res, { user: { phone: 'p' }, body });
+      return sent(res);
+    };
+
+    it('is limited to super admins and managers', async () => {
+      as('client');
+      const denied = await call('createServiceType', { name: 'Chiller AMC' });
+      expect(denied.status).toBe(403);
+      expect(denied.message).toBe('Only admins and managers can manage service types');
+    });
+
+    it('creates, rejects duplicates and deactivates', async () => {
+      as('eg_admin');
+      db('service_type').findFirst.mockResolvedValue({ id: 1 });
+      expect((await call('createServiceType', { name: 'chiller amc' })).message).toBe('Service type "chiller amc" already exists');
+
+      db('service_type').findFirst.mockResolvedValue(null);
+      db('service_type').create.mockResolvedValue({ id: 2, name: 'Chiller AMC' });
+      expect((await call('createServiceType', { name: ' Chiller  AMC ' })).status).toBe(200);
+      expect(db('service_type').create.mock.calls[0][0].data.name).toBe('Chiller AMC');
+
+      db('service_type').findUnique.mockResolvedValue({ id: 2, name: 'Chiller AMC' });
+      db('service_type').update.mockResolvedValue({ id: 2, name: 'Chiller AMC', is_active: false });
+      expect((await call('updateServiceType', { service_type_link: 2, is_active: false })).status).toBe(200);
+      expect(db('service_type').update.mock.calls[0][0].where).toEqual({ id: 2 });
+    });
+
+    it('lists only active types unless an admin asks for all', async () => {
+      db('service_type').findMany.mockResolvedValue([]);
+      as('client');
+      await call('getServiceTypes', { include_inactive: true });
+      expect(db('service_type').findMany.mock.calls[0][0].where).toEqual({ is_active: true });
+      as('eg_super_admin');
+      await call('getServiceTypes', { include_inactive: true });
+      expect(db('service_type').findMany.mock.calls[1][0].where).toEqual({});
+    });
+
+    it('resolves an equipment service_type_link', async () => {
+      expect(await service.resolveServiceTypeLink({})).toEqual({ link: undefined });
+      expect(await service.resolveServiceTypeLink({ service_type_link: null })).toEqual({ link: null });
+      db('service_type').findUnique.mockResolvedValue({ id: 4, is_active: false });
+      expect(await service.resolveServiceTypeLink({ service_type_link: 4 })).toEqual({ error: 'service_type_link must be an active service type' });
+      expect(await service.resolveServiceTypeLink({ service_type_link: 4 }, 4)).toEqual({ link: 4 });
+      db('service_type').findUnique.mockResolvedValue({ id: 5, is_active: true });
+      expect(await service.resolveServiceTypeLink({ service_type_link: '5' })).toEqual({ link: 5 });
+    });
+  });
+
   describe('wantsCredentialsEmail', () => {
     it('emails unless send_credentials is false', () => {
       expect(service.wantsCredentialsEmail({})).toBe(true);

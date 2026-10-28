@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, writeFileSync } from "fs";
 import * as moment from "moment";
 import { Prisma } from "@prisma/client";
 import { buildServiceReportPdf } from "./build_pdf";
+import { reportTimeline } from "../task_event/task-event";
 
 const prisma = new PrismaClient();
 
@@ -276,22 +277,7 @@ export class ServiceReportService {
       completed: "Awaiting Approval",
       closed: "Completed",
     };
-    const timeline = task.task_user.map((row) => {
-      const assignedTech = row.technician_link ? userById[row.technician_link] : null;
-      const titles = {
-        open: row.technician_link ? "Service engineer assigned" : "Task created",
-        in_progress: "Work started",
-        hold: "Task placed on hold",
-        completed: "Work completed; awaiting approval",
-        closed: "Task approved",
-      };
-      return {
-        date: moment(row.updated_at || row.created_at).format("YYYY-MM-DD"),
-        time: moment(row.updated_at || row.created_at).format("hh:mm A"),
-        title: titles[row.status] || String(row.status),
-        description: row.reason || (assignedTech ? `Assigned to ${assignedTech.name || assignedTech.phone}` : ""),
-      };
-    });
+    const timeline = await this.taskReportTimeline(task.id);
     const address = company?.address
       ? [company.address.address_line, company.address.locality, company.address.city,
           company.address.district, company.address.state, company.address.pincode,
@@ -348,6 +334,20 @@ export class ServiceReportService {
         status: statusLabels[task.task_user[task.task_user.length - 1]?.status || task.status || "open"] || data.status,
       },
     };
+  }
+
+  /** Raised, assigned / accepted, work started, completed and closed, from the ticket's timeline. */
+  async taskReportTimeline(taskId: number) {
+    const events = await prisma.task_event.findMany({
+      where: { task_link: taskId },
+      orderBy: [{ created_at: "asc" }, { id: "asc" }],
+    });
+    return reportTimeline(events).map((row) => ({
+      date: moment(row.at).format("YYYY-MM-DD"),
+      time: moment(row.at).format("hh:mm A"),
+      title: row.title,
+      description: row.detail,
+    }));
   }
 
   serialize(report) {
@@ -784,32 +784,7 @@ export class ServiceReportService {
         closed: "Completed",
         completed: "Awaiting Approval",
       };
-      const timeline = [
-        {
-          date: moment(task.created_at).format("YYYY-MM-DD"),
-          time: moment(task.created_at).format("hh:mm A"),
-          title: "Task created",
-          description: `${task.name || "Task"} was raised${
-            task.created_by ? ` by ${task.created_by}` : ""
-          }.`,
-        },
-      ];
-      for (const row of task.task_user) {
-        const tech = row.technician_link ? userById[row.technician_link] : null;
-        const titleByStatus = {
-          open: row.technician_link ? "Service engineer assigned" : "Awaiting service engineer",
-          in_progress: "Work started",
-          hold: "Task placed on hold",
-          completed: "Work completed; awaiting approval",
-          closed: "Task approved",
-        };
-        timeline.push({
-          date: moment(row.updated_at || row.created_at).format("YYYY-MM-DD"),
-          time: moment(row.updated_at || row.created_at).format("hh:mm A"),
-          title: titleByStatus[row.status] || String(row.status),
-          description: row.reason || (tech ? `${tech.name || "Service engineer"} was assigned to this task.` : ""),
-        });
-      }
+      const timeline = await this.taskReportTimeline(task.id);
       const individual = task.equipment_link == null;
       return res.status(200).send({
         status: 200,

@@ -19,6 +19,7 @@ import {
   audit_entity,
 } from "@prisma/client";
 import { writeAuditLog } from "../audit/audit-log";
+import { TaskEventType, holdNote, reportTimeline, taskEventForStatus, writeTaskEvent } from "../task_event/task-event";
 import { generateTemporaryPassword, hashPassword, verifyPassword } from "../auth/password";
 import * as crypto from "crypto";
 import puppeteer from "puppeteer";
@@ -1594,6 +1595,25 @@ export class UserService {
     });
   }
 
+  /** Adds a step to a ticket's timeline; never fails the request. */
+  async recordTaskEvent(
+    actor: { id?: number; name?: string | null; access_level?: access_level | string; designation?: string | null } | null,
+    taskId: number,
+    event: TaskEventType,
+    opts: { note?: string | null; target?: { id: number; name?: string | null } | null } = {},
+  ): Promise<void> {
+    await writeTaskEvent(prisma, {
+      taskId,
+      event,
+      actorLink: actor?.id ?? null,
+      actorName: actor?.name || "System",
+      actorRole: actor ? this.auditRoleLabel(actor.access_level, actor.designation) : "system",
+      targetLink: opts.target?.id ?? null,
+      targetName: opts.target?.name ?? null,
+      note: opts.note ?? null,
+    });
+  }
+
   private async auditFromReq(
     req,
     action: audit_action,
@@ -2138,17 +2158,11 @@ export class UserService {
         },
       });
       await this.recordAudit(actor, audit_action.deleted, audit_entity.task, task.id, task.ticket_no, `reason=${reason}`);
+      await this.recordTaskEvent(actor, task.id, "deleted", { note: reason });
 
-      const companyLink = task.equipment?.company_link;
-      const clientAdmins =
-        companyLink != null
-          ? await prisma.company_user.findMany({
-              where: { company_link: companyLink, user: { access_level: access_level.client_admin } },
-              select: { user_link: true },
-            })
-          : [];
+      const clientAdmins = await this.clientAdminIds(task.equipment?.company_link);
       await this.notifyTaskUsers(
-        [latest?.client_link, latest?.technician_link, ...clientAdmins.map((row) => row.user_link)],
+        [latest?.client_link, latest?.technician_link, ...clientAdmins],
         "Ticket deleted",
         task,
         `${actor.name} deleted ticket ${task.ticket_no}${task.name ? ` (${task.name})` : ""}. Reason: ${reason}`,
@@ -2430,6 +2444,7 @@ export class UserService {
       }
       const taskStatus = await this.getLatestStatusForTask(dbTask.id);
       await this.recordAudit(user, audit_action.created, audit_entity.task, dbTask.id, dbTask.ticket_no, dbTask.name);
+      await this.recordTaskEvent(user, dbTask.id, "raised", { note: dbTask.description || dbTask.name });
 
       return res.status(200).send({
         status: 200,
@@ -2831,6 +2846,20 @@ export class UserService {
           assignedTask.ticket_no,
           `technician_link=${taskUser.technician_link}`,
         );
+        const previousTechnician = task.task_user[0]?.technician_link;
+        const assignedTech = await prisma.user.findUnique({
+          where: { id: taskUser.technician_link },
+          select: { id: true, name: true },
+        });
+        await this.recordTaskEvent(
+          assigner,
+          assignedTask.id,
+          previousTechnician != null && previousTechnician !== taskUser.technician_link ? "reassigned" : "assigned",
+          { target: assignedTech },
+        );
+        if (selfAssign) {
+          await this.recordTaskEvent(assigner, assignedTask.id, "accepted");
+        }
         try {
           const assignedTask = await prisma.tasks.findUnique({
             where: { id: req.body.task_link },
@@ -2918,9 +2947,10 @@ export class UserService {
     const isAssignedServiceEngineer =
       actorRole === "technician" &&
       Number(dbTaskUser.technician_link) === actorId;
+    const isClientSide = actorRole === "client_admin" || actorRole === "client";
     let isLinkedCompanyUser = false;
     if (
-      actorRole === "client_admin" &&
+      isClientSide &&
       dbTaskUser.task?.equipment?.company_link != null
     ) {
       const companyLink = await prisma.company_user.findUnique({
@@ -2940,11 +2970,16 @@ export class UserService {
         status: HttpStatus.FORBIDDEN,
       });
     }
-    const isApprover = ["eg_super_admin", "eg_admin", "client_admin"].includes(actorRole);
-    if (taskStatus === status.closed && dbTaskUser.status === status.completed && !isApprover) {
+    if (isClientSide && taskStatus !== status.completed && taskStatus !== status.closed) {
       return res.status(HttpStatus.FORBIDDEN).send({
-        message: "Only an Admin, Client Admin, or Manager can approve a completed task",
+        message: "Clients and client admins can only mark tasks completed or closed",
         status: HttpStatus.FORBIDDEN,
+      });
+    }
+    if (isClientSide && dbTaskUser.status === status.closed) {
+      return res.status(HttpStatus.CONFLICT).send({
+        message: "This task is already closed",
+        status: HttpStatus.CONFLICT,
       });
     }
     if (actorRole === "technician" &&
@@ -2954,15 +2989,6 @@ export class UserService {
       return res.status(HttpStatus.FORBIDDEN).send({
         message: "Service engineers can move assigned tasks to In Progress, Hold, or Completed",
         status: HttpStatus.FORBIDDEN,
-      });
-    }
-    const legacyFollowUpAwaitingApproval =
-      dbTaskUser.status === status.in_progress && dbTaskUser.task?.follow_up === true;
-    if (taskStatus === status.closed && dbTaskUser.status !== status.completed &&
-        !legacyFollowUpAwaitingApproval && !isAdminOrManager) {
-      return res.status(HttpStatus.CONFLICT).send({
-        message: "Only completed tasks can be approved",
-        status: HttpStatus.CONFLICT,
       });
     }
     const dbTask = await prisma.tasks.findUnique({
@@ -3011,6 +3037,12 @@ export class UserService {
           },
         });
         await this.recordAudit(userInfo, audit_action.updated, audit_entity.task, dbTaskUser.task_link, dbTask?.ticket_no, `status=${taskStatus}`);
+        const event = taskEventForStatus(dbTaskUser.status, taskStatus);
+        if (event) {
+          await this.recordTaskEvent(userInfo, dbTaskUser.task_link, event, {
+            note: event === "hold" ? holdNote(req.body.hold) ?? req.body.reason : req.body.reason,
+          });
+        }
       }
     } else {
       returnMessage = {
@@ -3037,9 +3069,13 @@ export class UserService {
           actorUserId: userInfo?.id,
           notes: req.body.reason,
           isCompleted: taskStatus === status.completed || taskStatus === status.closed,
+          notifyCompany: !this.isFinishedStatus(taskStatus),
         });
       } catch (notifyError) {
         console.error("updateTaskStatus notification failed", notifyError);
+      }
+      if (this.isFinishedStatus(taskStatus) && dbTaskUser.status !== taskStatus) {
+        await this.notifyTaskFinished(dbTaskUser.task, dbTaskUser, userInfo, taskStatus, req.body.reason);
       }
     }
 
@@ -3348,6 +3384,8 @@ export class UserService {
         data: { closed_at: new Date(), approval: approval_state.confirmed, status: status.closed },
       });
       await this.recordAudit(requester, audit_action.updated, audit_entity.task, taskLink, task.ticket_no, "confirmed by client");
+      await this.recordTaskEvent(requester, taskLink, "closed", { note: "Confirmed by client" });
+      await this.notifyTaskFinished(task, latest, requester, status.closed);
     }
 
     return { ok: true };
@@ -3510,71 +3548,15 @@ export class UserService {
       : null;
     const currentStatus = latest?.status || "open";
 
-    const timeline: Array<{ time: string; title: string; detail: string }> = [
-      {
-        time: this.formatReportTime(task.created_at),
-        title: "Task created",
-        detail: `${task.name || "Task"} was raised${task.created_by ? ` by ${task.created_by}` : ""}.`,
-      },
-    ];
-
-    for (const row of task.task_user) {
-      const tech = row.technician_link ? userById[row.technician_link] : null;
-      const actor = row.updated_by || row.created_by || tech?.name || "System";
-      if (row.status === "open" && row.technician_link) {
-        timeline.push({
-          time: this.formatReportTime(row.updated_at || row.created_at),
-          title: "Service engineer assigned",
-          detail: `${tech?.name || "Service engineer"} accepted this task${actor ? ` (${actor})` : ""}.`,
-        });
-      } else if (row.status === "open") {
-        timeline.push({
-          time: this.formatReportTime(row.created_at),
-          title: "Awaiting service engineer",
-          detail: "Task is open and not assigned yet.",
-        });
-      } else if (row.status === "in_progress") {
-        timeline.push({
-          time: this.formatReportTime(row.updated_at || row.created_at),
-          title: "Work started",
-          detail: `${tech?.name || actor} moved the task to In Progress.`,
-        });
-      } else if (row.status === "hold") {
-        timeline.push({
-          time: this.formatReportTime(row.updated_at || row.created_at),
-          title: "Task put on hold",
-          detail: row.reason || `${actor} placed the task on hold.`,
-        });
-      } else if (row.status === "completed") {
-        timeline.push({
-          time: this.formatReportTime(row.updated_at || row.created_at),
-          title: "Work completed; awaiting approval",
-          detail: `${tech?.name || actor} marked the task complete.`,
-        });
-      } else if (row.status === "closed") {
-        timeline.push({
-          time: this.formatReportTime(row.updated_at || row.created_at),
-          title: "Task approved",
-          detail: `Service completed and approved${tech?.name ? ` for work by ${tech.name}` : ""}.`,
-        });
-      }
-    }
-
-    for (const hold of task.hold_reason || []) {
-      timeline.push({
-        time: this.formatReportTime(hold.created_at),
-        title: "Hold reason recorded",
-        detail: [hold.hold, hold.spare_part_number, hold.reason]
-          .filter(Boolean)
-          .join(" · "),
-      });
-    }
-
-    timeline.sort((a, b) => {
-      const left = moment(a.time, "DD MMM YYYY, hh:mm A").valueOf();
-      const right = moment(b.time, "DD MMM YYYY, hh:mm A").valueOf();
-      return left - right;
+    const events = await prisma.task_event.findMany({
+      where: { task_link: task.id },
+      orderBy: [{ created_at: "asc" }, { id: "asc" }],
     });
+    const timeline = reportTimeline(events).map((row) => ({
+      time: this.formatReportTime(row.at),
+      title: row.title,
+      detail: row.detail,
+    }));
 
     let outputImages: string[] = [];
     if (task.out_images) {
@@ -4138,6 +4120,16 @@ export class UserService {
             },
           });
           await this.recordAudit(actor, audit_action.updated, audit_entity.task, taskLink, task.ticket_no, "service completed");
+          if (latestAssignment.status !== status.completed) {
+            await this.recordTaskEvent(actor, taskLink, "completed", {
+              note: req.body.action_taken != null ? String(req.body.action_taken) : null,
+            });
+            const finishedTask = await prisma.tasks.findUnique({
+              where: { id: taskLink },
+              include: { equipment: { include: { company: true } } },
+            });
+            await this.notifyTaskFinished(finishedTask, latestAssignment, actor, status.completed);
+          }
         }
       }
 
@@ -5582,6 +5574,39 @@ export class UserService {
     return { task, latest: task.task_user[0] ?? null };
   }
 
+  private isFinishedStatus(value): boolean {
+    return value === status.completed || value === status.closed;
+  }
+
+  private async clientAdminIds(companyLink: number | null | undefined): Promise<number[]> {
+    if (companyLink == null) return [];
+    const rows = await prisma.company_user.findMany({
+      where: { company_link: companyLink, user: { access_level: access_level.client_admin } },
+      select: { user_link: true },
+    });
+    return rows.map((row) => row.user_link);
+  }
+
+  /** Completed / closed: tell the POC who raised it, the company's client admins and the engineer. */
+  private async notifyTaskFinished(
+    task,
+    assignment: { client_link?: number | null; technician_link?: number | null } | null,
+    actor: { id?: number; name?: string | null } | null,
+    finalStatus,
+    note?: string | null,
+  ) {
+    const closed = finalStatus === status.closed;
+    const admins = await this.clientAdminIds(task?.equipment?.company_link);
+    await this.notifyTaskUsers(
+      [assignment?.client_link, assignment?.technician_link, ...admins],
+      closed ? "Ticket closed" : "Ticket completed",
+      task,
+      `${actor?.name || "Someone"} ${closed ? "closed" : "marked completed"} ticket ${task?.ticket_no}` +
+        `${task?.name ? ` (${task.name})` : ""}.${note ? ` Notes: ${note}` : ""}`,
+      actor?.id,
+    );
+  }
+
   private async notifyTaskUsers(userIds: Array<number | null | undefined>, title: string, task, description: string, excludeUserId?: number) {
     try {
       await this.notificationService.pushToUsers(
@@ -5618,6 +5643,7 @@ export class UserService {
       data: { approval: next, manager_link: actor.id, updated_at: new Date(), updated_by: req.user?.phone },
     });
     await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, note ? `approved: ${note}` : "approved");
+    await this.recordTaskEvent(actor, updated.id, "approved", { note });
     await this.notifyTaskUsers(
       [ctx.latest?.client_link],
       "Ticket approved",
@@ -5663,6 +5689,7 @@ export class UserService {
       });
     });
     await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, `rejected: ${reason}`);
+    await this.recordTaskEvent(actor, updated.id, "rejected", { note: reason });
     await this.notifyTaskUsers(
       [ctx.latest?.client_link],
       "Ticket rejected",
@@ -5671,6 +5698,45 @@ export class UserService {
       actor.id,
     );
     return res.status(200).send({ status: 200, message: "Ticket rejected", data: updated });
+  }
+
+  /** Every step on a ticket, oldest first. Visible to whoever can see the ticket; deleted tickets to admins only. */
+  async getTaskTimeline(res, req) {
+    const actor = await this.loadActor(req);
+    const taskId = parseInt(String(req.body?.task_link ?? ""), 10);
+    if (!Number.isFinite(taskId)) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "task_link is required" });
+    }
+    const task = await prisma.tasks.findUnique({
+      where: { id: taskId },
+      select: {
+        deleted_at: true,
+        equipment: { select: { company_link: true } },
+        task_user: { orderBy: { id: "desc" }, take: 1, select: { technician_link: true } },
+      },
+    });
+    if (!task || (task.deleted_at && !this.adminOrNot(actor?.access_level))) {
+      return res.send({ status: HttpStatus.NO_CONTENT, message: "Task not found" });
+    }
+    if (!this.canSeeTask(actor, task.task_user[0]?.technician_link, task.equipment?.company_link)) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "You do not have access to this ticket" });
+    }
+    const events = await prisma.task_event.findMany({
+      where: { task_link: taskId },
+      orderBy: [{ created_at: "asc" }, { id: "asc" }],
+      select: {
+        id: true,
+        event: true,
+        actor_link: true,
+        actor_name: true,
+        actor_role: true,
+        target_link: true,
+        target_name: true,
+        note: true,
+        created_at: true,
+      },
+    });
+    return res.status(200).send({ status: 200, data: events });
   }
 
   async acceptTask(res, req) {
@@ -5691,6 +5757,7 @@ export class UserService {
         });
     if (!ctx.task.accepted_at) {
       await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, "accepted by service engineer");
+      await this.recordTaskEvent(actor, updated.id, "accepted");
     }
     return res.status(200).send({ status: 200, message: "Ticket accepted", data: updated });
   }
@@ -5729,6 +5796,8 @@ export class UserService {
       });
     });
     await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, `service engineer unassigned (was ${removedTechnician})`);
+    const removed = await prisma.user.findUnique({ where: { id: removedTechnician }, select: { id: true, name: true } });
+    await this.recordTaskEvent(actor, updated.id, "unassigned", { target: removed });
     await this.notifyTaskUsers(
       [removedTechnician],
       "Task unassigned",
@@ -5753,6 +5822,7 @@ export class UserService {
       data: { escalated: true, escalation_reason: reason, updated_at: new Date(), updated_by: req.user?.phone },
     });
     await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, `escalated: ${reason}`);
+    await this.recordTaskEvent(actor, updated.id, "escalated", { note: reason });
     try {
       await this.notificationService.pushToLevels(
         [access_level.eg_super_admin, access_level.eg_admin],
@@ -5781,6 +5851,7 @@ export class UserService {
       data: { escalated: false, escalation_reason: null, updated_at: new Date(), updated_by: req.user?.phone },
     });
     await this.recordAudit(actor, audit_action.updated, audit_entity.task, updated.id, updated.ticket_no, "de-escalated");
+    await this.recordTaskEvent(actor, updated.id, "deescalated");
     return res.status(200).send({ status: 200, message: "Ticket de-escalated", data: updated });
   }
 
@@ -5998,6 +6069,7 @@ export class UserService {
         if (row) {
           generated.push(row);
           await this.recordAudit(actor, audit_action.created, audit_entity.task, row.task_link, row.task?.ticket_no, `PM task for schedule ${schedule.id}`);
+          await this.recordTaskEvent(actor, row.task_link, "raised", { note: "Scheduled preventive maintenance visit" });
         }
       } catch (error) {
         this.logger.error(`PM generation failed for schedule ${schedule.id}`, error);

@@ -88,6 +88,11 @@ export class UserController {
     return await this.userService.acceptTask(res, req);
   }
 
+  @Post("getTaskTimeline")
+  async getTaskTimeline(@Res() res: Response, @Req() req: Request) {
+    return await this.userService.getTaskTimeline(res, req);
+  }
+
   @Post("unassignTask")
   async unassignTask(@Res() res: Response, @Req() req: Request) {
     return await this.userService.unassignTask(res, req);

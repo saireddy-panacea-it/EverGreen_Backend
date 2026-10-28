@@ -588,13 +588,14 @@ describe('UserService', () => {
     it('returns the canonical service engineer designations', () => {
       expect(normalize('Senior Service Engineer')).toBe('Senior Service Engineer');
       expect(normalize('  senior   service engineer ')).toBe('Senior Service Engineer');
-      expect(normalize('Junior Service Engineer')).toBe('Junior Service Engineer');
-      expect(normalize('JUNIOR SERVICE ENGINEER')).toBe('Junior Service Engineer');
+      expect(normalize('Service Engineer')).toBe('Service Engineer');
+      expect(normalize('SERVICE ENGINEER')).toBe('Service Engineer');
     });
 
-    it('maps the legacy Junior Technician input to Junior Service Engineer', () => {
-      expect(normalize('Junior Technician')).toBe('Junior Service Engineer');
-      expect(normalize(' junior technician ')).toBe('Junior Service Engineer');
+    it('maps the legacy junior designations to Service Engineer', () => {
+      expect(normalize('Junior Service Engineer')).toBe('Service Engineer');
+      expect(normalize('Junior Technician')).toBe('Service Engineer');
+      expect(normalize(' junior technician ')).toBe('Service Engineer');
     });
 
     it('rejects anything else', () => {
@@ -614,7 +615,7 @@ describe('UserService', () => {
       });
       expect(sent(res)).toEqual({
         status: 400,
-        message: 'designation must be Senior Service Engineer or Junior Service Engineer',
+        message: 'designation must be Senior Service Engineer or Service Engineer',
       });
     });
   });

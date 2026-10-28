@@ -41,7 +41,7 @@ import { PDFDocument, rgb } from "pdf-lib";
 import fs from "fs";
 const prisma = new PrismaClient();
 const SENIOR_DESIGNATION = "Senior Service Engineer";
-const JUNIOR_DESIGNATION = "Junior Service Engineer";
+const JUNIOR_DESIGNATION = "Service Engineer";
 const DESIGNATION_MESSAGE = `designation must be ${SENIOR_DESIGNATION} or ${JUNIOR_DESIGNATION}`;
 const TM_FREQUENCY_MESSAGE =
   "tm_frequency must be daily, weekly, biweekly, monthly, bi_monthly, tri_monthly, quarterly, semi_annual or annual";
@@ -450,7 +450,7 @@ export class UserService {
       const hasClientAdminDetails = [adminName, mobile, adminEmail, adminPassword].some(Boolean);
       if (hasClientAdminDetails && (!adminName || !mobile || !adminEmail || !adminPassword)) {
         return res.send({
-          message: "Please provide all client admin details or leave them all empty",
+          message: "Please provide all company manager details or leave them all empty",
           status: HttpStatus.BAD_REQUEST,
         });
       }
@@ -555,7 +555,7 @@ export class UserService {
         }
         await this.notificationService.onNewAmc({
           companyName: dbCompany.name,
-          managerName: dbUser?.name ?? "No client admin assigned",
+          managerName: dbUser?.name ?? "No company manager assigned",
           location: dbCompany.location,
         });
       } catch (notifyError) {
@@ -563,7 +563,7 @@ export class UserService {
       }
       await this.auditFromReq(req, audit_action.created, audit_entity.amc, dbCompany.id, this.companyLabel(dbCompany));
       if (dbUser) {
-        await this.auditFromReq(req, audit_action.created, audit_entity.user, dbUser.id, dbUser.name, "client admin for new AMC");
+        await this.auditFromReq(req, audit_action.created, audit_entity.user, dbUser.id, dbUser.name, "company manager for new AMC");
       }
 
       return res.status(200).send({
@@ -793,7 +793,7 @@ export class UserService {
       this.attachedCompanyIds(userInfo).includes(companyId);
     if (!isAdmin && !isLinkedClientAdmin) {
       return {
-        error: "Only admins or the company's client admin can change client admin details",
+        error: "Only admins or the company's company manager can change company manager details",
         status: HttpStatus.FORBIDDEN,
       };
     }
@@ -850,7 +850,7 @@ export class UserService {
 
     if (!adminName || !mobile || !adminEmail || !adminPassword) {
       return {
-        error: "Please provide all client admin details or leave them all empty",
+        error: "Please provide all company manager details or leave them all empty",
         status: HttpStatus.BAD_REQUEST,
       };
     }
@@ -1258,7 +1258,7 @@ export class UserService {
     }
     if (actorLevel === access_level.client_admin) {
       if (!this.isClientRole(requestedLevel)) {
-        return { allowed: false, message: "Client admins can only create client or client admin users" };
+        return { allowed: false, message: "Company managers can only create POC or company manager users" };
       }
       if (actorCompanyIds.length === 0) {
         return { allowed: false, message: "You are not linked to any company" };
@@ -1298,7 +1298,7 @@ export class UserService {
         return { allowed: false, message: "You do not have access to update this user" };
       }
       if (requestedLevel != null && !this.isClientRole(requestedLevel)) {
-        return { allowed: false, message: "Client admins can only assign client or client admin access" };
+        return { allowed: false, message: "Company managers can only assign POC or company manager access" };
       }
       if (requestedCompanyIds?.some((id) => !actor.companyIds.includes(id))) {
         return { allowed: false, message: "You can only link users to your own companies" };
@@ -3032,7 +3032,7 @@ export class UserService {
     }
     if (isClientSide && taskStatus !== status.completed && taskStatus !== status.closed) {
       return res.status(HttpStatus.FORBIDDEN).send({
-        message: "Clients and client admins can only mark tasks completed or closed",
+        message: "POCs and company managers can only mark tasks completed or closed",
         status: HttpStatus.FORBIDDEN,
       });
     }
@@ -3319,7 +3319,7 @@ export class UserService {
           requester?.access_level !== access_level.client_admin) {
         return res.status(HttpStatus.FORBIDDEN).send({
           status: HttpStatus.FORBIDDEN,
-          message: "Only an Admin, Client Admin, or Manager can approve a task",
+          message: "Only an Admin, Company Manager, or Manager can approve a task",
         });
       }
       const taskLink = await this.resolveTaskLink(
@@ -4959,7 +4959,7 @@ export class UserService {
   private normalizeTechnicianDesignation(value: unknown): string | null {
     const normalized = String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
     if (normalized === "senior service engineer") return SENIOR_DESIGNATION;
-    if (normalized === "junior service engineer" || normalized === "junior technician") {
+    if (["service engineer", "junior service engineer", "junior technician"].includes(normalized)) {
       return JUNIOR_DESIGNATION;
     }
     return null;

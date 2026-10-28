@@ -34,6 +34,7 @@ model user {
   tokens        tokens[]
   notifications notifications[]
   managed_tasks       tasks[]     @relation("task_manager")
+  deleted_tasks       tasks[]     @relation("task_deleter")
   verified_equipments equipment[] @relation("equipment_verifier")
   audit_logs          audit_log[]
 }
@@ -204,6 +205,7 @@ enum audit_entity {
   amc
   equipment
   auth
+  issue_type
 }
 
 model equipment {
@@ -283,9 +285,28 @@ model tasks {
   contact_name         String?
   contact_phone        String?
   address              String?
+  location             String?
+  issue_type_link      Int?
+  issue_type           issue_type?    @relation(fields: [issue_type_link], references: [id], onDelete: SetNull)
+  deleted_at           DateTime?
+  deleted_by           Int?
+  deleter              user?          @relation("task_deleter", fields: [deleted_by], references: [id], onDelete: SetNull)
+  delete_reason        String?
   pm_generated         pm_generated_task[]
+}
 
-  @@unique([equipment_link, name, description, call_type], name: "tasks_equipment_link_name_description_call_type")
+/// Issue types offered when raising a task. Rows with a call_type are the
+/// three built-in types the older apps still send by key.
+model issue_type {
+  id         Int        @id @default(autoincrement())
+  name       String     @unique @db.VarChar(60)
+  call_type  call_type?
+  is_active  Boolean    @default(true)
+  created_at DateTime   @default(now())
+  created_by String?
+  updated_at DateTime   @default(now())
+  updated_by String?
+  tasks      tasks[]
 }
 
 model images {

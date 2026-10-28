@@ -256,9 +256,9 @@ export class NotificationService {
     phone?: string | null;
     password?: string | null;
     access_level?: string | null;
-  }) {
+  }): Promise<boolean> {
     if (!user?.email) {
-      return;
+      return false;
     }
     const body = `Dear ${user.name || 'User'},
 
@@ -272,7 +272,7 @@ Sign in with your phone number and password. Please change your password after t
 
 Best regards,
 EverGreen`;
-    await this.sendEmail(user.email, 'Your EverGreen account credentials', body);
+    return this.sendEmail(user.email, 'Your EverGreen account credentials', body);
   }
 
   private roleLabel(level?: string | null) {
@@ -428,7 +428,7 @@ Please review this task in the EverGreen app.`,
     // Use only the latest assignment record for each task when counting workload.
     const workload = new Map(technicians.map((technician) => [technician.id, 0]));
     const assignedTasks = await prisma.tasks.findMany({
-      where: { task_user: { some: { technician_link: { not: null } } } },
+      where: { deleted_at: null, task_user: { some: { technician_link: { not: null } } } },
       select: {
         task_user: {
           orderBy: { id: 'desc' },
@@ -455,6 +455,7 @@ Please review this task in the EverGreen app.`,
     const overdueTasks = await prisma.tasks.findMany({
       where: {
         created_at: { lte: eligibleBefore },
+        deleted_at: null,
         task_user: {
           some: { status: status.open, technician_link: null },
         },
@@ -708,7 +709,7 @@ This is an automated EverGreen notification.`,
   async runHoldAlerts() {
     try {
     const holdRows = await prisma.task_user.findMany({
-      where: { status: status.hold },
+      where: { status: status.hold, task: { deleted_at: null } },
       orderBy: { id: 'desc' },
       include: {
         task: {

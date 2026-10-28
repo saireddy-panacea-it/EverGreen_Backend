@@ -44,6 +44,10 @@ const JUNIOR_DESIGNATION = "Junior Service Engineer";
 const DESIGNATION_MESSAGE = `designation must be ${SENIOR_DESIGNATION} or ${JUNIOR_DESIGNATION}`;
 const TM_FREQUENCY_MESSAGE =
   "tm_frequency must be daily, weekly, biweekly, monthly, bi_monthly, tri_monthly, quarterly, semi_annual or annual";
+const TASK_DELETE_REASON_MAX = 500;
+const TASK_LOCATION_MAX = 200;
+const TASK_LOCATION_MESSAGE = `location must be at most ${TASK_LOCATION_MAX} characters`;
+const ISSUE_TYPE_NAME_MAX = 60;
 import nodemailer from "nodemailer";
 import { FirebaseService } from "../firebase/firebase.service"; // Update the import path as necessary
 import { NotificationService, taskPlaceLabel } from "../notification/notification.service";
@@ -162,8 +166,11 @@ export class UserService {
         }
       }
 
+      let emailSent = false;
       try {
-        await this.notificationService.sendCredentialsEmail({ ...dbUser, password: req.body.password });
+        if (this.wantsCredentialsEmail(req.body)) {
+          emailSent = await this.notificationService.sendCredentialsEmail({ ...dbUser, password: req.body.password });
+        }
         if (String(dbUser.access_level).toLowerCase() === "technician") {
           const actor = await this.findOne(req.user?.phone);
           await this.notificationService.onNewTechnician({
@@ -180,6 +187,7 @@ export class UserService {
       return res.status(200).send({
         status: 200,
         data: this.withoutPassword(dbUser),
+        email_sent: emailSent,
         message: "user created succesfully",
       });
     } else {
@@ -537,9 +545,10 @@ export class UserService {
       const dbCompany = created.company;
       const dbUser = created.admin;
 
+      let emailSent = false;
       try {
-        if (dbUser?.email.trim() && adminPassword) {
-          await this.notificationService.sendCredentialsEmail({ ...dbUser, password: adminPassword });
+        if (dbUser?.email.trim() && adminPassword && this.wantsCredentialsEmail(req.body)) {
+          emailSent = await this.notificationService.sendCredentialsEmail({ ...dbUser, password: adminPassword });
         }
         await this.notificationService.onNewAmc({
           companyName: dbCompany.name,
@@ -558,6 +567,7 @@ export class UserService {
         message: "company created successfully",
         status: 200,
         data: dbCompany,
+        email_sent: emailSent,
       });
     } catch (error) {
       return res.send({
@@ -728,9 +738,10 @@ export class UserService {
         });
       });
 
-      if (clientAdminPlan.kind === "create") {
+      let emailSent = false;
+      if (clientAdminPlan.kind === "create" && this.wantsCredentialsEmail(req.body)) {
         try {
-          await this.notificationService.sendCredentialsEmail({
+          emailSent = await this.notificationService.sendCredentialsEmail({
             ...clientAdminPlan.data,
             password: String(req.body.password ?? "").trim(),
           });
@@ -744,6 +755,7 @@ export class UserService {
         status: 200,
         message: "company updated successfully",
         data: updatedCompany,
+        email_sent: emailSent,
       });
     } catch (error) {
       return res.send({
@@ -1902,7 +1914,7 @@ export class UserService {
     try {
       const taskId = parseInt(req.body.task_link, 10);
       const dbTask = await prisma.tasks.findUnique({ where: { id: taskId } });
-      if (!dbTask) {
+      if (!dbTask || dbTask.deleted_at) {
         return res.send({ status: 204, message: "Task not found" });
       }
       const triageActor = await this.loadActor(req);
@@ -1956,12 +1968,25 @@ export class UserService {
       if ("error" in contact) {
         return res.send({ status: HttpStatus.BAD_REQUEST, message: contact.error });
       }
+      const location = this.parseTaskLocation(req.body?.location);
+      if (location === "invalid") {
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: TASK_LOCATION_MESSAGE });
+      }
+      const issue =
+        this.hasBodyValue(req.body?.issue_type_link) || this.hasBodyValue(req.body?.call_type)
+          ? await this.resolveIssueType(req.body)
+          : null;
+      if (issue && "error" in issue) {
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: issue.error });
+      }
+      const issueData = issue && !("error" in issue) ? issue : null;
       const updated = await prisma.tasks.update({
         where: { id: taskId },
         data: {
           name: req.body.name ?? dbTask.name,
           description: req.body.description ?? dbTask.description,
-          call_type: req.body.call_type ?? dbTask.call_type,
+          ...(issueData ? { call_type: issueData.call_type, issue_type_link: issueData.issue_type_link } : {}),
+          ...(location !== undefined ? { location } : {}),
           equipment_link: req.body.equipment_link ?? dbTask.equipment_link,
           ...contact.data,
           ...triage.data,
@@ -2069,24 +2094,69 @@ export class UserService {
     return { changed, data };
   }
 
+  /**
+   * Soft-deletes a ticket that is still open (raised or assigned, work not
+   * started). Only super admins and EverGreen managers may delete, and a
+   * reason is required. The raiser (POC), the company's client admins and
+   * the assigned engineer are notified.
+   */
   async deleteTask(res, req) {
     try {
-      const taskId = parseInt(req.body.task_link, 10);
-      const dbTask = await prisma.tasks.findUnique({ where: { id: taskId } });
-      if (!dbTask) {
+      const actor = await this.loadActor(req);
+      if (!actor || !this.adminOrNot(actor.access_level)) {
+        return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and managers can delete tasks" });
+      }
+      const reason = String(req.body?.reason ?? "").trim();
+      if (!reason) {
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: "A reason is required to delete a task" });
+      }
+      if (reason.length > TASK_DELETE_REASON_MAX) {
+        return res.send({
+          status: HttpStatus.BAD_REQUEST,
+          message: `Reason must be at most ${TASK_DELETE_REASON_MAX} characters`,
+        });
+      }
+      const ctx = await this.loadTaskContext(req.body?.task_link);
+      if (!ctx) {
         return res.send({ status: 204, message: "Task not found" });
       }
-      const denied = await this.taskAccessDenied(req, dbTask, "delete");
-      if (denied) {
-        return res.send({ status: HttpStatus.FORBIDDEN, message: denied });
+      const { task, latest } = ctx;
+      if (latest?.status !== status.open) {
+        return res.send({
+          status: HttpStatus.CONFLICT,
+          message: "Only open tasks (not yet started) can be deleted",
+        });
       }
-      await prisma.hold_reason.deleteMany({ where: { task_link: taskId } });
-      await prisma.images.deleteMany({ where: { taskId } });
-      await prisma.task_user.deleteMany({ where: { task_link: taskId } });
-      await prisma.tasks.delete({ where: { id: taskId } });
-      await this.auditFromReq(req, audit_action.deleted, audit_entity.task, dbTask.id, dbTask.ticket_no, dbTask.name);
+      const deleted = await prisma.tasks.update({
+        where: { id: task.id },
+        data: {
+          deleted_at: new Date(),
+          deleted_by: actor.id,
+          delete_reason: reason,
+          updated_at: new Date(),
+          updated_by: req.user?.phone || "",
+        },
+      });
+      await this.recordAudit(actor, audit_action.deleted, audit_entity.task, task.id, task.ticket_no, `reason=${reason}`);
+
+      const companyLink = task.equipment?.company_link;
+      const clientAdmins =
+        companyLink != null
+          ? await prisma.company_user.findMany({
+              where: { company_link: companyLink, user: { access_level: access_level.client_admin } },
+              select: { user_link: true },
+            })
+          : [];
+      await this.notifyTaskUsers(
+        [latest?.client_link, latest?.technician_link, ...clientAdmins.map((row) => row.user_link)],
+        "Ticket deleted",
+        task,
+        `${actor.name} deleted ticket ${task.ticket_no}${task.name ? ` (${task.name})` : ""}. Reason: ${reason}`,
+        actor.id,
+      );
       return res.status(200).send({
         status: 200,
+        data: this.stripTaskRelations(deleted),
         message: "Task deleted successfully",
       });
     } catch (error) {
@@ -2251,9 +2321,25 @@ export class UserService {
         });
       }
       raiser = await this.findOne(userPhone);
+      const active = await this.activeTaskForEquipment(dbEquipment.id);
+      if (active) {
+        return res.send({
+          status: HttpStatus.CONFLICT,
+          data: active,
+          message: `An active task (Ticket ${active.ticket_no}) already exists for this equipment. Close it before raising another.`,
+        });
+      }
     }
 
-    const callType = mapCallTypeToEnum(req.body?.call_type);
+    const issue = await this.resolveIssueType(req.body ?? {});
+    if ("error" in issue) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: issue.error });
+    }
+    const callType = issue.call_type ?? undefined;
+    const location = this.parseTaskLocation(req.body?.location);
+    if (location === "invalid") {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: TASK_LOCATION_MESSAGE });
+    }
     let priority: task_priority = callType === call_type.breakdown ? task_priority.high : task_priority.medium;
     if (this.hasBodyValue(req.body?.priority)) {
       priority = this.normalizePriority(req.body.priority);
@@ -2278,6 +2364,8 @@ export class UserService {
         taskName + req.body.description + (callType ?? undefined)
       ),
       call_type: callType ?? undefined,
+      issue_type_link: issue.issue_type_link,
+      location: location ?? null,
       otp: this.generateOtp(),
       created_at: undefined,
       created_by: userPhone,
@@ -2289,23 +2377,24 @@ export class UserService {
       manager_link: this.adminOrNot(raiser?.access_level) ? raiser.id : null,
     };
 
-    const existingTask = await prisma.tasks.findFirst({
-      where: {
-        equipment_link: task.equipment_link,
-        name: task.name,
-        description: task.description,
-        call_type: callType ?? undefined,
-        ...(contact ? { contact_phone: contact.contact_phone } : {}),
-      },
-    });
+    const existingTask = contact
+      ? await prisma.tasks.findFirst({
+          where: {
+            equipment_link: null,
+            name: task.name,
+            description: task.description,
+            call_type: callType ?? undefined,
+            contact_phone: contact.contact_phone,
+            deleted_at: null,
+          },
+        })
+      : null;
 
     if (existingTask) {
       return res.send({
         status: HttpStatus.CONFLICT,
         data: existingTask,
-        message: contact
-          ? `task already exist with same name, description, contact_phone and call_type combo`
-          : `task already exist with same name, description, equipment and call_type combo`,
+        message: `task already exist with same name, description, contact_phone and call_type combo`,
       });
     }
 
@@ -2360,6 +2449,168 @@ export class UserService {
     return images.map((path) => ({
       url: path,
     }));
+  }
+
+  /** Credentials are emailed unless the caller sends `send_credentials: false`. */
+  wantsCredentialsEmail(body): boolean {
+    return body?.send_credentials !== false && body?.send_credentials !== "false";
+  }
+
+  /** undefined when absent, null when blank, "invalid" when too long. */
+  parseTaskLocation(value: unknown): string | null | undefined | "invalid" {
+    if (value === undefined) return undefined;
+    const text = String(value ?? "").trim();
+    if (!text) return null;
+    return text.length > TASK_LOCATION_MAX ? "invalid" : text;
+  }
+
+  /**
+   * The issue type of a new / edited task: `issue_type_link` (an active
+   * issue type) wins; otherwise the legacy `call_type` key is linked to its
+   * built-in issue type.
+   */
+  async resolveIssueType(
+    body,
+  ): Promise<{ issue_type_link: number | null; call_type: call_type | null } | { error: string }> {
+    if (this.hasBodyValue(body?.issue_type_link)) {
+      const id = parseInt(String(body.issue_type_link), 10);
+      const row = Number.isFinite(id) ? await prisma.issue_type.findUnique({ where: { id } }) : null;
+      if (!row || !row.is_active) {
+        return { error: "issue_type_link must be an active issue type" };
+      }
+      return { issue_type_link: row.id, call_type: row.call_type };
+    }
+    const callType = mapCallTypeToEnum(body?.call_type) ?? null;
+    if (!callType) return { issue_type_link: null, call_type: null };
+    const row = await prisma.issue_type.findFirst({ where: { call_type: callType }, select: { id: true } });
+    return { issue_type_link: row?.id ?? null, call_type: callType };
+  }
+
+  /** The equipment's task that is not closed or deleted, if any. */
+  async activeTaskForEquipment(equipmentId: number) {
+    const tasks = await prisma.tasks.findMany({
+      where: { equipment_link: equipmentId, deleted_at: null },
+      orderBy: { id: "desc" },
+      select: {
+        id: true,
+        ticket_no: true,
+        name: true,
+        task_user: { orderBy: { id: "desc" }, take: 1, select: { status: true } },
+      },
+    });
+    const active = tasks.find((t) => t.task_user[0] && t.task_user[0].status !== status.closed);
+    return active
+      ? { id: active.id, ticket_no: active.ticket_no, name: active.name, status: active.task_user[0].status }
+      : null;
+  }
+
+  async getActiveTaskForEquipment(res, req) {
+    const equipmentId = parseInt(String(req.body?.equipment_link ?? ""), 10);
+    if (!Number.isFinite(equipmentId)) {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: "equipment_link is required" });
+    }
+    const equipment = await prisma.equipment.findUnique({
+      where: { id: equipmentId },
+      select: { company_link: true },
+    });
+    if (!equipment) {
+      return res.send({ status: 204, message: "Equipment not found" });
+    }
+    const userInfo = await this.findOne(req.user?.phone);
+    if (!this.canAccessCompany(userInfo, equipment.company_link)) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: UserService.FOREIGN_EQUIPMENT_MESSAGE });
+    }
+    return res.status(200).send({
+      status: 200,
+      data: await this.activeTaskForEquipment(equipmentId),
+      message: "ok",
+    });
+  }
+
+  async getIssueTypes(res, req) {
+    const userInfo = await this.findOne(req.user?.phone);
+    const includeInactive =
+      this.adminOrNot(userInfo?.access_level) &&
+      (req.body?.include_inactive === true || req.body?.include_inactive === "true");
+    const rows = await prisma.issue_type.findMany({
+      where: includeInactive ? {} : { is_active: true },
+      orderBy: { id: "asc" },
+    });
+    return res.status(200).send({ status: 200, data: rows, message: "ok" });
+  }
+
+  private parseIssueTypeName(value: unknown): string | { error: string } {
+    const name = String(value ?? "").trim().replace(/\s+/g, " ");
+    if (!name) return { error: "name is required" };
+    if (name.length > ISSUE_TYPE_NAME_MAX) {
+      return { error: `name must be at most ${ISSUE_TYPE_NAME_MAX} characters` };
+    }
+    return name;
+  }
+
+  private async issueTypeNameTaken(name: string, exceptId?: number): Promise<boolean> {
+    const row = await prisma.issue_type.findFirst({
+      where: {
+        name: { equals: name, mode: "insensitive" },
+        ...(exceptId != null ? { id: { not: exceptId } } : {}),
+      },
+      select: { id: true },
+    });
+    return row != null;
+  }
+
+  async createIssueType(res, req) {
+    const actor = await this.loadActor(req);
+    if (!actor || !this.adminOrNot(actor.access_level)) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and managers can manage issue types" });
+    }
+    const name = this.parseIssueTypeName(req.body?.name);
+    if (typeof name !== "string") {
+      return res.send({ status: HttpStatus.BAD_REQUEST, message: name.error });
+    }
+    if (await this.issueTypeNameTaken(name)) {
+      return res.send({ status: HttpStatus.CONFLICT, message: `Issue type "${name}" already exists` });
+    }
+    const created = await prisma.issue_type.create({
+      data: { name, created_by: req.user?.phone, updated_by: req.user?.phone },
+    });
+    await this.recordAudit(actor, audit_action.created, audit_entity.issue_type, created.id, created.name, "created");
+    return res.status(200).send({ status: 200, data: created, message: "Issue type created" });
+  }
+
+  async updateIssueType(res, req) {
+    const actor = await this.loadActor(req);
+    if (!actor || !this.adminOrNot(actor.access_level)) {
+      return res.send({ status: HttpStatus.FORBIDDEN, message: "Only admins and managers can manage issue types" });
+    }
+    const id = parseInt(String(req.body?.issue_type_link ?? ""), 10);
+    const existing = Number.isFinite(id) ? await prisma.issue_type.findUnique({ where: { id } }) : null;
+    if (!existing) {
+      return res.send({ status: 204, message: "Issue type not found" });
+    }
+    const data: { name?: string; is_active?: boolean; updated_at: Date; updated_by?: string } = {
+      updated_at: new Date(),
+      updated_by: req.user?.phone,
+    };
+    if (req.body?.name !== undefined) {
+      const name = this.parseIssueTypeName(req.body.name);
+      if (typeof name !== "string") {
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: name.error });
+      }
+      if (await this.issueTypeNameTaken(name, id)) {
+        return res.send({ status: HttpStatus.CONFLICT, message: `Issue type "${name}" already exists` });
+      }
+      data.name = name;
+    }
+    if (req.body?.is_active !== undefined) {
+      if (typeof req.body.is_active !== "boolean") {
+        return res.send({ status: HttpStatus.BAD_REQUEST, message: "is_active must be true or false" });
+      }
+      data.is_active = req.body.is_active;
+    }
+    const updated = await prisma.issue_type.update({ where: { id }, data });
+    await this.recordAudit(actor, audit_action.updated, audit_entity.issue_type, updated.id, updated.name, JSON.stringify({ name: data.name, is_active: data.is_active }));
+    return res.status(200).send({ status: 200, data: updated, message: "Issue type updated" });
   }
 
   generateOtp(): string {
@@ -2509,6 +2760,7 @@ export class UserService {
       },
       select: {
         manager_link: true,
+        deleted_at: true,
         task_user: {
           orderBy: {
             id: "desc",
@@ -2522,7 +2774,9 @@ export class UserService {
     let taskUser;
     const taskStatus = mapStatusToEnum(req.body.status);
 
-    if (task && task.task_user?.length === 0) {
+    if (task?.deleted_at) {
+      response = { message: "This task was deleted", status: 204 };
+    } else if (task && task.task_user?.length === 0) {
       response = { message: `no tasks found`, status: 204 };
     } else if (task) {
       if (
@@ -2652,7 +2906,7 @@ export class UserService {
       },
     });
 
-    if (dbTaskUser == null) {
+    if (dbTaskUser == null || dbTaskUser.task?.deleted_at) {
       return res.send({
         message: "task not found.",
         status: 404,
@@ -2873,6 +3127,7 @@ export class UserService {
       where: {
         task: {
           equipment_link: equipment.id,
+          deleted_at: null,
         },
       },
       include: {
@@ -3570,6 +3825,7 @@ export class UserService {
     });
 
     const isAdmin = this.adminOrNot(userInfo?.access_level) ?? false;
+    const deletedOnly = isAdmin && !stats && (req.body?.deleted === true || req.body?.deleted === "true");
 
     let whereCondition;
     const companyLinks = companyUsers.map((x) => x.company_link);
@@ -3609,10 +3865,13 @@ export class UserService {
         id: {
           in: latestTasks.map((x) => x.id),
         },
+        task: { deleted_at: deletedOnly ? { not: null } : null },
       },
       include: {
         task: {
           include: {
+            issue_type: { select: { id: true, name: true } },
+            deleter: { select: { id: true, name: true } },
             equipment: {
               include: {
                 company: true,
@@ -5319,7 +5578,7 @@ export class UserService {
         task_user: { orderBy: { id: "desc" }, take: 1 },
       },
     });
-    if (!task) return null;
+    if (!task || task.deleted_at) return null;
     return { task, latest: task.task_user[0] ?? null };
   }
 
@@ -5676,8 +5935,18 @@ export class UserService {
       orderBy: { next_due: "asc" },
     });
     const generated = [];
+    const skipped = [];
+    const pmIssueType = await prisma.issue_type.findFirst({
+      where: { call_type: call_type.amc_preventive_maintenance },
+      select: { id: true },
+    });
     for (const schedule of schedules) {
       if (schedule.equipment.status === equipment_status.retired) continue;
+      const active = await this.activeTaskForEquipment(schedule.equipment_link);
+      if (active) {
+        skipped.push({ schedule_link: schedule.id, equipment_link: schedule.equipment_link, active_task: active });
+        continue;
+      }
       try {
         const row = await prisma.$transaction(async (tx) => {
           const claimed = await tx.pm_schedule.updateMany({
@@ -5700,6 +5969,7 @@ export class UserService {
               description,
               equipment_link: schedule.equipment_link,
               call_type: call_type.amc_preventive_maintenance,
+              issue_type_link: pmIssueType?.id ?? null,
               ticket_no: getAccountFromCompany(name + description + call_type.amc_preventive_maintenance),
               otp: this.generateOtp(),
               status: status.open,
@@ -5735,8 +6005,11 @@ export class UserService {
     }
     return res.status(200).send({
       status: 200,
-      message: `Generated ${generated.length} PM task${generated.length === 1 ? "" : "s"}`,
+      message:
+        `Generated ${generated.length} PM task${generated.length === 1 ? "" : "s"}` +
+        (skipped.length ? `; skipped ${skipped.length} with an active task` : ""),
       data: generated,
+      skipped,
     });
   }
 
@@ -5832,8 +6105,8 @@ export class UserService {
       const start = thisMonth.clone().subtract(11 - index, "months");
       const range = { gte: start.toDate(), lt: start.clone().add(1, "month").toDate() };
       const [tasksCreated, tasksClosed, companies, users] = await Promise.all([
-        prisma.tasks.count({ where: { created_at: range } }),
-        prisma.tasks.count({ where: { closed_at: range } }),
+        prisma.tasks.count({ where: { created_at: range, deleted_at: null } }),
+        prisma.tasks.count({ where: { closed_at: range, deleted_at: null } }),
         prisma.company.count({ where: { created_at: range } }),
         prisma.user.count({ where: { created_at: range } }),
       ]);

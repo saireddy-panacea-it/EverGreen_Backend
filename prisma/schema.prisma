@@ -35,6 +35,8 @@ model user {
   notifications notifications[]
   managed_tasks       tasks[]     @relation("task_manager")
   deleted_tasks       tasks[]     @relation("task_deleter")
+  task_events_done    task_event[] @relation("task_event_actor")
+  task_events_target  task_event[] @relation("task_event_target")
   verified_equipments equipment[] @relation("equipment_verifier")
   audit_logs          audit_log[]
 }
@@ -288,6 +290,7 @@ model tasks {
   location             String?
   issue_type_link      Int?
   issue_type           issue_type?    @relation(fields: [issue_type_link], references: [id], onDelete: SetNull)
+  events               task_event[]
   deleted_at           DateTime?
   deleted_by           Int?
   deleter              user?          @relation("task_deleter", fields: [deleted_by], references: [id], onDelete: SetNull)
@@ -297,6 +300,25 @@ model tasks {
 
 /// Issue types offered when raising a task. Rows with a call_type are the
 /// three built-in types the older apps still send by key.
+/// One step on a ticket's timeline (raised, assigned, started, hold, ...).
+model task_event {
+  id          Int      @id @default(autoincrement())
+  task_link   Int
+  task        tasks    @relation(fields: [task_link], references: [id], onDelete: Cascade)
+  event       String   @db.VarChar(30)
+  actor_link  Int?
+  actor       user?    @relation("task_event_actor", fields: [actor_link], references: [id], onDelete: SetNull)
+  actor_name  String
+  actor_role  String
+  target_link Int?
+  target      user?    @relation("task_event_target", fields: [target_link], references: [id], onDelete: SetNull)
+  target_name String?
+  note        String?
+  created_at  DateTime @default(now())
+
+  @@index([task_link, created_at])
+}
+
 model issue_type {
   id         Int        @id @default(autoincrement())
   name       String     @unique @db.VarChar(60)

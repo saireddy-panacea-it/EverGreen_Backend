@@ -1050,6 +1050,140 @@ describe('UserService', () => {
     });
   });
 
+  describe('completing and closing tasks', () => {
+    const task = { id: 41, name: 'AC not cooling', ticket_no: 'T-1', equipment_link: 8, equipment: { company_link: 3, company: { name: 'Acme' } } };
+    const actorAs = (access_level: string, id = 5, companies = [3]) =>
+      jest.spyOn(service, 'findOne').mockResolvedValue({
+        id,
+        name: 'Asha',
+        access_level,
+        company_user: companies.map((company_link) => ({ company_link })),
+      } as any);
+    const run = async (current: string, next: string, opts: { technician?: number | null; sub?: number; body?: any } = {}) => {
+      db('task_user').findUnique.mockResolvedValue({
+        id: 9,
+        technician_link: opts.technician === undefined ? 30 : opts.technician,
+        client_link: 20,
+        task_link: 41,
+        status: current,
+        task,
+      });
+      db('company_user').findUnique.mockResolvedValue({ user_link: opts.sub ?? 5 });
+      db('company_user').findMany.mockResolvedValue([{ user_link: 21 }]);
+      db('tasks').findUnique.mockResolvedValue(task);
+      db('task_user').update.mockResolvedValue({ id: 9, status: next });
+      db('task_user').findFirst.mockResolvedValue({ status: next });
+      db('tasks').update.mockResolvedValue(task);
+      const res = mockRes();
+      await service.updateTaskStatus(res, {
+        user: { phone: 'p', sub: opts.sub ?? 5 },
+        body: { task_user_link: 9, status: next, ...(opts.body ?? {}) },
+      });
+      return sent(res);
+    };
+
+    beforeEach(() => {
+      notifications.pushToUsers = jest.fn();
+      notifications.taskPayload = jest.fn(() => ({}));
+    });
+
+    it('lets super admins, managers, POCs and client admins complete or close an assigned task', async () => {
+      for (const level of ['eg_super_admin', 'eg_admin', 'client', 'client_admin']) {
+        for (const [current, next] of [['open', 'completed'], ['in_progress', 'closed'], ['hold', 'closed'], ['completed', 'closed']]) {
+          actorAs(level);
+          expect(await run(current, next)).toMatchObject({ status: 200 });
+        }
+      }
+    });
+
+    it('limits POCs and client admins to their company and to completing or closing', async () => {
+      actorAs('client', 5, [99]);
+      db('company_user').findUnique.mockResolvedValue(null);
+      const outsider = await (async () => {
+        db('task_user').findUnique.mockResolvedValue({ id: 9, technician_link: 30, client_link: 20, task_link: 41, status: 'open', task });
+        const res = mockRes();
+        await service.updateTaskStatus(res, { user: { phone: 'p', sub: 5 }, body: { task_user_link: 9, status: 'closed' } });
+        return sent(res);
+      })();
+      expect(outsider.status).toBe(403);
+
+      actorAs('client_admin');
+      expect(await run('open', 'in_progress')).toMatchObject({ status: 403 });
+      actorAs('client');
+      expect(await run('closed', 'completed')).toMatchObject({ status: 409, message: 'This task is already closed' });
+    });
+
+    it('still needs an engineer assigned', async () => {
+      actorAs('eg_admin');
+      expect((await run('open', 'closed', { technician: null })).message).toContain('service engineer is not assigned');
+    });
+
+    it('notifies the raiser, client admins and engineer, and records who closed it', async () => {
+      actorAs('client');
+      await run('in_progress', 'closed', { body: { reason: 'Working fine now' } });
+      const [userIds, title, , excluded] = notifications.pushToUsers.mock.calls[0];
+      expect(userIds).toEqual([20, 30, 21]);
+      expect(title).toBe('Ticket closed');
+      expect(excluded).toBe(5);
+      expect(notifications.onTaskStatusUpdated).toHaveBeenCalledWith(expect.objectContaining({ notifyCompany: false }));
+      expect(db('task_event').create.mock.calls[0][0].data).toMatchObject({
+        task_link: 41,
+        event: 'closed',
+        actor_link: 5,
+        actor_name: 'Asha',
+        actor_role: 'client',
+        note: 'Working fine now',
+      });
+    });
+
+    it('records hold reasons and resumes on the timeline', async () => {
+      actorAs('technician', 30);
+      await run('in_progress', 'hold', { sub: 30, body: { hold: { hold_reason: 'spare_required', reason: 'Compressor' } } });
+      expect(db('task_event').create.mock.calls[0][0].data).toMatchObject({ event: 'hold', note: 'Spare Required · Compressor' });
+      await run('hold', 'in_progress', { sub: 30 });
+      expect(db('task_event').create.mock.calls[1][0].data).toMatchObject({ event: 'resumed' });
+      expect(notifications.pushToUsers).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getTaskTimeline', () => {
+    const timeline = async (body) => {
+      const res = mockRes();
+      await service.getTaskTimeline(res, { user: { phone: 'p' }, body });
+      return sent(res);
+    };
+    const actorAs = (access_level: string, companies: number[] = []) =>
+      jest.spyOn(service, 'findOne').mockResolvedValue({
+        id: 5,
+        name: 'Asha',
+        access_level,
+        company_user: companies.map((company_link) => ({ company_link })),
+      } as any);
+
+    it('returns events oldest first to people who can see the ticket', async () => {
+      actorAs('client', [3]);
+      db('tasks').findUnique.mockResolvedValue({ deleted_at: null, equipment: { company_link: 3 }, task_user: [{ technician_link: 30 }] });
+      db('task_event').findMany.mockResolvedValue([{ id: 1, event: 'raised' }]);
+      expect(await timeline({ task_link: 41 })).toEqual({ status: 200, data: [{ id: 1, event: 'raised' }] });
+      expect(db('task_event').findMany.mock.calls[0][0]).toMatchObject({
+        where: { task_link: 41 },
+        orderBy: [{ created_at: 'asc' }, { id: 'asc' }],
+      });
+    });
+
+    it('hides other companies, unassigned engineers and deleted tickets', async () => {
+      actorAs('client', [9]);
+      db('tasks').findUnique.mockResolvedValue({ deleted_at: null, equipment: { company_link: 3 }, task_user: [{ technician_link: 30 }] });
+      expect((await timeline({ task_link: 41 })).status).toBe(403);
+      actorAs('technician');
+      expect((await timeline({ task_link: 41 })).status).toBe(403);
+      actorAs('client', [3]);
+      db('tasks').findUnique.mockResolvedValue({ deleted_at: new Date(), equipment: { company_link: 3 }, task_user: [] });
+      expect((await timeline({ task_link: 41 })).status).toBe(204);
+      expect(db('task_event').findMany).not.toHaveBeenCalled();
+    });
+  });
+
   describe('updateTaskFeedback on an individual task', () => {
     it('skips the equipment lookup and still notifies', async () => {
       const task = { id: 41, ticket_no: 'T-1', equipment_link: null };

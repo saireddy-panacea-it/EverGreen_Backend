@@ -10,6 +10,7 @@ import {
 import * as nodemailer from 'nodemailer';
 import { FirebaseService } from '../firebase/firebase.service';
 import { writeAuditLog } from '../audit/audit-log';
+import { writeTaskEvent } from '../task_event/task-event';
 
 const prisma = new PrismaClient();
 
@@ -506,6 +507,14 @@ Please review this task in the EverGreen app.`,
         entityName: task.ticket_no,
         details: `technician_link=${technician.id}`,
       });
+      await writeTaskEvent(prisma, {
+        taskId: task.id,
+        event: 'assigned',
+        actorName: 'Automatic assignment',
+        actorRole: 'system',
+        targetLink: technician.id,
+        targetName: technician.name,
+      });
 
       workload.set(technician.id, (workload.get(technician.id) ?? 0) + 1);
       try {
@@ -538,6 +547,8 @@ Please review this task in the EverGreen app.`,
     actorUserId?: number;
     notes?: string;
     isCompleted: boolean;
+    /** False when the caller notifies the raiser and client admins itself (completed / closed). */
+    notifyCompany?: boolean;
   }) {
     const notesBit = opts.notes ? ` Notes: ${opts.notes}` : '';
     const payload = this.taskPayload(
@@ -549,7 +560,8 @@ Please review this task in the EverGreen app.`,
 
     // Without a company, client levels would resolve to every client in the system.
     const hasCompany = opts.companyLink != null;
-    if (hasCompany) {
+    const notifyCompany = hasCompany && opts.notifyCompany !== false;
+    if (notifyCompany) {
       await this.pushToLevels(
         [ROLE.AMC_MANAGER, ROLE.CLIENT],
         opts.companyLink,
@@ -578,7 +590,7 @@ Please review this task in the EverGreen app.`,
       opts.actorUserId,
     );
 
-    if (opts.isCompleted && hasCompany) {
+    if (opts.isCompleted && notifyCompany) {
       await this.pushToLevels(
         [ROLE.AMC_MANAGER],
         opts.companyLink,
